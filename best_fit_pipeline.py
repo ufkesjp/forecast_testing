@@ -757,6 +757,7 @@ def evaluate_benchmarks(df: pd.DataFrame, date_col: str, id_col: str,
     min_required = min_train_weeks + eval_window + (n_folds - 1) * fold_spacing
     skipped = 0
     eval_results = []
+    fold_details = []
 
     for series_id, grp in df.groupby(id_col):
         grp = grp.sort_values(date_col).reset_index(drop=True)
@@ -798,6 +799,15 @@ def evaluate_benchmarks(df: pd.DataFrame, date_col: str, id_col: str,
                 fold_metrics[model_name]["actuals"].append(np.sum(test_actual))
                 fold_metrics[model_name]["forecasts"].append(np.sum(preds_trimmed))
 
+                for i in range(eval_window):
+                    fold_details.append({
+                        id_col: series_id,
+                        "model": model_name,
+                        "fold": fold_idx + 1,
+                        "actual": test_actual[i],
+                        "forecast": preds_trimmed[i],
+                    })
+
             folds_evaluated += 1
 
         if folds_evaluated == 0:
@@ -836,7 +846,7 @@ def evaluate_benchmarks(df: pd.DataFrame, date_col: str, id_col: str,
               f"(need {min_train_weeks} train + {eval_window} eval + "
               f"{(n_folds - 1) * fold_spacing} spacing).")
 
-    return pd.DataFrame(eval_results)
+    return pd.DataFrame(eval_results), pd.DataFrame(fold_details)
 
 
 # =============================================================
@@ -1124,7 +1134,7 @@ def best_fit_pipeline(df: pd.DataFrame, date_col: str, id_col: str,
     # Step 1: Evaluate with rolling-origin CV
     print(f"Step 1/4: Rolling-origin evaluation ({n_folds} folds x "
           f"{eval_window}-week window, {fold_spacing}-week spacing)...")
-    eval_df = evaluate_benchmarks(
+    eval_df, fold_details = evaluate_benchmarks(
         active_df, date_col, id_col, value_col,
         eval_window=eval_window, n_folds=n_folds, fold_spacing=fold_spacing
     )
@@ -1268,7 +1278,7 @@ def summarize_results(best_fit_df: pd.DataFrame, eval_df: pd.DataFrame,
     return summary
 
 # To run the whole pipeline 
-eval_df, best_fit_df, forecast_df, inactive_df = best_fit_pipeline(
+eval_df, best_fit_df, forecast_df, inactive_df, fold_details= best_fit_pipeline(
     df, date_col="date", id_col="item_id", value_col="demand",
     inactive_weeks=26,  # 6-month lookback
 )

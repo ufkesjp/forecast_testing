@@ -17,8 +17,15 @@ Evaluation Metrics:
     - MASE (Mean Absolute Scaled Error)
 
 Selection:
-    - Tournament-style best-fit model selection per series using a
-      weighted composite of WAPE and MASE.
+    - Tournament-style best-fit model selection per series using
+      rolling-origin cross-validation with a configurable evaluation
+      window (default 13 weeks / 3 months). Metrics are averaged
+      across folds for robust model selection.
+
+Pre-Processing:
+    - Inactive item detection and exclusion. Items with zero demand
+      in the trailing N weeks (default 26) are flagged as inactive
+      and excluded from the forecasting pipeline.
 
 Version History:
     v1.0.0  2026-02-13  Initial release. Five benchmark models, WAPE/MASE
@@ -26,16 +33,25 @@ Version History:
     v1.1.0  2026-02-13  Refactored for efficiency: vectorized forecast
                          generation, eliminated per-row apply filtering,
                          consolidated model registry, added progress logging.
+    v1.2.0  2026-02-13  Rolling-origin cross-validation with configurable
+                         eval_window (default 13 weeks for 3-month WAPE).
+                         Metrics averaged across folds for stable selection.
+                         Decoupled eval_window from forecast horizon. Added
+                         per-fold detail in evaluation output.
+    v1.3.0  2026-02-13  Added inactive item detection. Items with zero demand
+                         in the trailing window (default 26 weeks) are flagged
+                         and excluded before benchmarking. Pipeline returns a
+                         4-tuple including the inactive items DataFrame.
 
 Author: [Your Name / Team]
 License: [Your License]
 """
 
-__version__ = "1.1.0"
+__version__ = "1.3.0"
 
 import numpy as np
 import pandas as pd
-from typing import Tuple, Optional, Dict, Callable
+from typing import Tuple, Optional, Dict, Callable, List
 
 # =============================================================
 # Model Registry
@@ -53,6 +69,132 @@ def register_model(name: str):
         MODEL_REGISTRY[name] = func
         return func
     return decorator
+
+
+# =============================================================
+# Inactive Item Detection
+# =============================================================
+
+def flag_inactive_items(df: pd.DataFrame, date_col: str, id_col: str,
+                        value_col: str,
+                        inactive_weeks: int = 26) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    '''
+    Flag and Separate Inactive Items  [v1.3.0]
+    ============================================
+    Identifies items with zero total demand in the most recent
+    `inactive_weeks` weeks and separates them from active items.
+    Inactive items are excluded from the forecasting pipeline to
+    avoid wasting compute on likely discontinued or dormant series.
+
+    An item is considered INACTIVE if:
+        - The sum of its demand over the last `inactive_weeks` weeks
+          (based on the most recent date in the ENTIRE dataset) is
+          exactly zero, OR
+        - The item has no data rows at all in the trailing window.
+
+    This uses the global max date across all series as the reference
+    point, so all items are evaluated against the same calendar window.
+    This prevents items that simply stopped receiving data rows from
+    being missed.
+
+    Inputs
+    ------
+    df : pd.DataFrame
+        Long-format DataFrame, one row per series per week.
+
+        Expected schema:
+            - date_col  : datetime-like — week-ending Sunday dates
+            - id_col    : str/categorical — unique series identifier
+            - value_col : numeric — non-negative demand
+
+    date_col : str
+        Column name for week-ending dates.
+
+    id_col : str
+        Column name for series identifiers.
+
+    value_col : str
+        Column name for demand values.
+
+    inactive_weeks : int, default 26
+        Number of trailing weeks to check for activity. Items with
+        zero total demand in this window are flagged inactive.
+        26 weeks ≈ 6 months is a reasonable default; adjust based
+        on your product lifecycle (e.g., 13 for faster-moving goods,
+        52 for slow-moving capital equipment).
+
+    Output
+    ------
+    Tuple of (active_df, inactive_df)
+
+        active_df : pd.DataFrame
+            Subset of `df` containing only rows for active items
+            (same schema as input). Ready to pass into the pipeline.
+
+        inactive_df : pd.DataFrame
+            One row per inactive item with diagnostic details.
+
+            Schema:
+                - id_col               : str      — series identifier
+                - "status"             : str      — always "inactive"
+                - "last_nonzero_date"  : datetime — most recent date with
+                                                    demand > 0 (NaT if never)
+                - "weeks_since_demand" : int      — weeks between last nonzero
+                                                    demand and the global max
+                                                    date (NaN if never)
+                - "total_history_weeks": int      — total weeks of data for item
+                - "lifetime_total_qty" : float    — sum of all demand ever
+
+            Example:
+                | item_id | status   | last_nonzero_date | weeks_since_demand | ... |
+                |---------|----------|-------------------|--------------------|-----|
+                | SKU_099 | inactive | 2025-03-15        |                 47 | ... |
+                | SKU_100 | inactive | NaT               |                NaN | ... |
+    '''
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col])
+
+    global_max_date = df[date_col].max()
+    cutoff_date = global_max_date - pd.Timedelta(weeks=inactive_weeks)
+
+    # --- Trailing window demand per item ---
+    trailing = df[df[date_col] > cutoff_date]
+    trailing_demand = trailing.groupby(id_col)[value_col].sum()
+
+    # --- All item IDs (including those with no trailing rows) ---
+    all_ids = df[id_col].unique()
+    trailing_demand = trailing_demand.reindex(all_ids, fill_value=0)
+
+    inactive_ids = trailing_demand[trailing_demand == 0].index
+    active_ids = trailing_demand[trailing_demand > 0].index
+
+    # --- Build inactive diagnostics ---
+    inactive_records = []
+    if len(inactive_ids) > 0:
+        for item_id in inactive_ids:
+            item_data = df[df[id_col] == item_id]
+            nonzero = item_data[item_data[value_col] > 0]
+
+            if len(nonzero) > 0:
+                last_nonzero = nonzero[date_col].max()
+                weeks_since = int((global_max_date - last_nonzero).days / 7)
+            else:
+                last_nonzero = pd.NaT
+                weeks_since = np.nan
+
+            inactive_records.append({
+                id_col: item_id,
+                "status": "inactive",
+                "last_nonzero_date": last_nonzero,
+                "weeks_since_demand": weeks_since,
+                "total_history_weeks": len(item_data),
+                "lifetime_total_qty": item_data[value_col].sum(),
+            })
+
+    inactive_df = pd.DataFrame(inactive_records)
+    active_df = df[df[id_col].isin(active_ids)].copy()
+
+    return active_df, inactive_df
 
 
 # =============================================================
@@ -132,7 +274,6 @@ def weekly_historical_average(history: np.ndarray, dates: np.ndarray,
     dates_ts = pd.DatetimeIndex(dates)
     week_numbers = dates_ts.isocalendar().week.astype(int).values
 
-    # Build week-of-year average lookup using numpy for speed
     global_mean = history.mean()
     week_avg = {}
     for w in range(1, 54):
@@ -142,7 +283,6 @@ def weekly_historical_average(history: np.ndarray, dates: np.ndarray,
         else:
             week_avg[w] = global_mean
 
-    # Generate forecast dates and map
     start_date = dates_ts[-1] + pd.Timedelta(weeks=1)
     forecast_dates = pd.date_range(start_date, periods=horizon, freq="W-SUN")
     forecast_weeks = forecast_dates.isocalendar().week.astype(int).values
@@ -437,7 +577,7 @@ def _forecast_single_series(history: np.ndarray, dates: np.ndarray,
 
 
 # =============================================================
-# Forecast Generation (All Models × All Series)
+# Forecast Generation (All Models x All Series)
 # =============================================================
 
 def run_all_benchmarks(df: pd.DataFrame, date_col: str, id_col: str,
@@ -449,10 +589,6 @@ def run_all_benchmarks(df: pd.DataFrame, date_col: str, id_col: str,
     Iterates over every unique series in a long-format DataFrame,
     generates forecasts from each benchmark model, and returns a
     consolidated long-format DataFrame.
-
-    Refactored in v1.1.0: uses pre-allocated list of dicts built per
-    series (not per row) and concatenated once at the end, avoiding
-    quadratic list growth.
 
     Inputs
     ------
@@ -488,7 +624,7 @@ def run_all_benchmarks(df: pd.DataFrame, date_col: str, id_col: str,
     Output
     ------
     pd.DataFrame
-        Long-format, one row per series × model × forecast week.
+        Long-format, one row per series x model x forecast week.
 
         Schema:
             - id_col     : str      — series identifier
@@ -525,21 +661,44 @@ def run_all_benchmarks(df: pd.DataFrame, date_col: str, id_col: str,
 
 
 # =============================================================
-# Evaluation Runner
+# Rolling-Origin Cross-Validation Evaluation
 # =============================================================
 
 def evaluate_benchmarks(df: pd.DataFrame, date_col: str, id_col: str,
-                        value_col: str, horizon: int = 52,
-                        holdout_weeks: int = 52) -> pd.DataFrame:
+                        value_col: str, eval_window: int = 13,
+                        n_folds: int = 3, fold_spacing: int = 13,
+                        min_train_weeks: int = 52) -> pd.DataFrame:
     '''
-    Backtest All Models Using a Holdout Split  [v1.1.0]
-    ====================================================
-    Splits each series into training and test sets, generates forecasts
-    from each benchmark model using only training data, and evaluates
-    against held-out actuals using WAPE and MASE.
+    Rolling-Origin Cross-Validation Evaluation  [v1.2.0]
+    =====================================================
+    Evaluates all benchmark models using rolling-origin backtesting.
+    Multiple evaluation folds are created by sliding the train/test
+    cutoff backward through time, each using a fixed-width evaluation
+    window. Metrics are computed per fold, then averaged across folds
+    for stable model selection.
 
-    Series with insufficient history (< holdout_weeks + 52 rows) are
-    skipped with a warning printed to stdout.
+    This approach is aligned with 3-month WAPE evaluation: each fold
+    tests on a 13-week window, and the average across folds prevents
+    one anomalous quarter from dominating the selection.
+
+    Fold Layout (example: n_folds=3, eval_window=13, fold_spacing=13)
+    ------------------------------------------------------------------
+    Given a series with 130 weeks of data:
+
+        Fold 1 (most recent):
+            Train: weeks 1-117    |  Test: weeks 118-130
+
+        Fold 2:
+            Train: weeks 1-104    |  Test: weeks 105-117
+
+        Fold 3:
+            Train: weeks 1-91     |  Test: weeks 92-104
+
+    Each fold's training set is used to generate a 13-week forecast,
+    which is scored against the corresponding 13-week test window.
+
+    Series with insufficient history are skipped. The minimum required
+    length is: min_train_weeks + eval_window + (n_folds - 1) * fold_spacing.
 
     Inputs
     ------
@@ -560,28 +719,44 @@ def evaluate_benchmarks(df: pd.DataFrame, date_col: str, id_col: str,
     value_col : str
         Column name for demand values.
 
-    horizon : int, default 52
-        Forecast horizon passed to each model. Should match holdout_weeks.
+    eval_window : int, default 13
+        Number of weeks in each evaluation (test) window. Set to 13
+        for 3-month WAPE alignment. This is independent of the final
+        forecast horizon.
 
-    holdout_weeks : int, default 52
-        Number of most recent weeks reserved as the test set.
+    n_folds : int, default 3
+        Number of rolling-origin folds. More folds = more stable
+        evaluation but requires longer history. Recommended: 3-4.
+
+    fold_spacing : int, default 13
+        Number of weeks between the start of consecutive folds.
+        Default 13 (one quarter) ensures folds don't overlap when
+        eval_window=13 and captures different seasonal quarters.
+
+    min_train_weeks : int, default 52
+        Minimum number of training weeks required for the earliest
+        fold. Set to 52 to ensure at least one full year of training
+        data is always available.
 
     Output
     ------
     pd.DataFrame
-        One row per series × model.
+        One row per series x model with metrics averaged across folds.
 
         Schema:
             - id_col           : str   — series identifier
             - "model"          : str   — benchmark model name
-            - "wape"           : float — WAPE on holdout
-            - "mase"           : float — MASE on holdout
-            - "total_actual"   : float — sum of actual demand in holdout
-            - "total_forecast" : float — sum of forecasted demand in holdout
+            - "wape"           : float — mean WAPE across folds
+            - "mase"           : float — mean MASE across folds
+            - "total_actual"   : float — sum of actual demand across all folds
+            - "total_forecast" : float — sum of forecasted demand across all folds
+            - "n_folds"        : int   — number of folds successfully evaluated
+            - "wape_std"       : float — std dev of WAPE across folds (stability)
+            - "fold_wapes"     : str   — comma-separated WAPE per fold (diagnostics)
     '''
-    eval_results = []
+    min_required = min_train_weeks + eval_window + (n_folds - 1) * fold_spacing
     skipped = 0
-    min_required = holdout_weeks + 52
+    eval_results = []
 
     for series_id, grp in df.groupby(id_col):
         grp = grp.sort_values(date_col).reset_index(drop=True)
@@ -591,32 +766,75 @@ def evaluate_benchmarks(df: pd.DataFrame, date_col: str, id_col: str,
             skipped += 1
             continue
 
-        # --- Train / test split ---
-        train = grp.iloc[:-holdout_weeks]
-        test = grp.iloc[-holdout_weeks:]
+        all_values = grp[value_col].values.astype(float)
+        all_dates = pd.to_datetime(grp[date_col]).values
 
-        train_history = train[value_col].values.astype(float)
-        train_dates = pd.to_datetime(train[date_col]).values
-        test_actual = test[value_col].values.astype(float)
+        # --- Build fold cutpoints ---
+        fold_metrics = {name: {"wapes": [], "mases": [], "actuals": [], "forecasts": []}
+                        for name in MODEL_REGISTRY}
 
-        eval_horizon = min(horizon, holdout_weeks)
-        actual_trimmed = test_actual[:eval_horizon]
+        folds_evaluated = 0
+        for fold_idx in range(n_folds):
+            test_end = n - (fold_idx * fold_spacing)
+            test_start = test_end - eval_window
+            train_end = test_start
 
-        model_outputs = _forecast_single_series(train_history, train_dates, eval_horizon)
+            if train_end < min_train_weeks:
+                continue
 
-        for model_name, preds in model_outputs.items():
-            preds_trimmed = preds[:eval_horizon]
+            train_history = all_values[:train_end]
+            train_dates = all_dates[:train_end]
+            test_actual = all_values[test_start:test_end]
+
+            model_outputs = _forecast_single_series(train_history, train_dates, eval_window)
+
+            for model_name, preds in model_outputs.items():
+                preds_trimmed = preds[:eval_window]
+                wape = calculate_wape(test_actual, preds_trimmed)
+                mase = calculate_mase(test_actual, preds_trimmed, train_history)
+
+                fold_metrics[model_name]["wapes"].append(wape)
+                fold_metrics[model_name]["mases"].append(mase)
+                fold_metrics[model_name]["actuals"].append(np.sum(test_actual))
+                fold_metrics[model_name]["forecasts"].append(np.sum(preds_trimmed))
+
+            folds_evaluated += 1
+
+        if folds_evaluated == 0:
+            skipped += 1
+            continue
+
+        # --- Average metrics across folds ---
+        for model_name, metrics in fold_metrics.items():
+            if not metrics["wapes"]:
+                continue
+
+            wapes = np.array(metrics["wapes"])
+            mases = np.array(metrics["mases"])
+
+            wapes_clean = np.where(np.isinf(wapes), np.nan, wapes)
+            mases_clean = np.where(np.isinf(mases), np.nan, mases)
+
+            mean_wape = np.nanmean(wapes_clean) if not np.all(np.isnan(wapes_clean)) else np.inf
+            mean_mase = np.nanmean(mases_clean) if not np.all(np.isnan(mases_clean)) else np.inf
+
             eval_results.append({
                 id_col: series_id,
                 "model": model_name,
-                "wape": calculate_wape(actual_trimmed, preds_trimmed),
-                "mase": calculate_mase(actual_trimmed, preds_trimmed, train_history),
-                "total_actual": np.sum(actual_trimmed),
-                "total_forecast": np.sum(preds_trimmed),
+                "wape": mean_wape,
+                "mase": mean_mase,
+                "total_actual": np.sum(metrics["actuals"]),
+                "total_forecast": np.sum(metrics["forecasts"]),
+                "n_folds": len(metrics["wapes"]),
+                "wape_std": np.nanstd(wapes_clean) if len(wapes_clean) > 1 else 0.0,
+                "fold_wapes": ",".join([f"{w:.4f}" if np.isfinite(w) else "inf"
+                                        for w in wapes]),
             })
 
     if skipped:
-        print(f"WARNING: Skipped {skipped} series with < {min_required} weeks of history.")
+        print(f"WARNING: Skipped {skipped} series with < {min_required} weeks of history "
+              f"(need {min_train_weeks} train + {eval_window} eval + "
+              f"{(n_folds - 1) * fold_spacing} spacing).")
 
     return pd.DataFrame(eval_results)
 
@@ -632,17 +850,18 @@ def select_best_fit(eval_df: pd.DataFrame, id_col: str,
                     secondary_weight: float = 0.3,
                     fallback_model: str = "seasonal_naive") -> pd.DataFrame:
     '''
-    Tournament-Style Best-Fit Model Selection  [v1.1.0]
+    Tournament-Style Best-Fit Model Selection  [v1.2.0]
     ====================================================
     For each series, selects the model with the lowest weighted
-    composite score of two evaluation metrics.
+    composite score of two evaluation metrics (averaged across
+    rolling-origin folds in v1.2.0+).
 
     Tournament Logic
     ----------------
     Per series:
         1. FILTER out models with inf/nan metrics.
         2. NORMALIZE both metrics to [0, 1] via min-max within-series.
-        3. COMPOSITE = primary_weight × norm_primary + secondary_weight × norm_secondary
+        3. COMPOSITE = primary_weight x norm_primary + secondary_weight x norm_secondary
         4. SELECT the model with the lowest composite score.
         5. TIEBREAK: lowest raw primary metric wins.
         6. FALLBACK: if all models invalid, assign fallback_model.
@@ -650,15 +869,17 @@ def select_best_fit(eval_df: pd.DataFrame, id_col: str,
     Inputs
     ------
     eval_df : pd.DataFrame
-        Output of `evaluate_benchmarks()`. One row per series × model.
+        Output of `evaluate_benchmarks()`. One row per series x model.
 
         Expected schema:
             - id_col               : str   — series identifier
             - "model"              : str   — model name
-            - primary_metric col   : float — e.g. "wape"
-            - secondary_metric col : float — e.g. "mase"
+            - primary_metric col   : float — e.g. "wape" (averaged across folds)
+            - secondary_metric col : float — e.g. "mase" (averaged across folds)
             - "total_actual"       : float
             - "total_forecast"     : float
+            - "n_folds"            : int   — number of folds evaluated
+            - "wape_std"           : float — fold-to-fold WAPE variability
 
     id_col : str
         Series identifier column name.
@@ -687,10 +908,12 @@ def select_best_fit(eval_df: pd.DataFrame, id_col: str,
             - id_col              : str   — series identifier
             - "best_model"        : str   — winning model name
             - "composite_score"   : float — winning composite score
-            - primary_metric      : float — winner's primary metric
-            - secondary_metric    : float — winner's secondary metric
-            - "total_actual"      : float — holdout actual demand
-            - "total_forecast"    : float — winner's total forecast
+            - primary_metric      : float — winner's mean primary metric
+            - secondary_metric    : float — winner's mean secondary metric
+            - "total_actual"      : float — holdout actual demand (all folds)
+            - "total_forecast"    : float — winner's total forecast (all folds)
+            - "n_folds"           : int   — folds evaluated for winner
+            - "wape_std"          : float — winner's WAPE std across folds
             - "selection_method"  : str   — "tournament", "tiebreak", or "fallback"
     '''
     best_fits = []
@@ -704,7 +927,6 @@ def select_best_fit(eval_df: pd.DataFrame, id_col: str,
         ].copy()
 
         if len(valid) == 0:
-            # Fallback
             fallback_row = grp[grp["model"] == fallback_model]
             if len(fallback_row) == 0:
                 fallback_row = grp.iloc[:1]
@@ -717,6 +939,8 @@ def select_best_fit(eval_df: pd.DataFrame, id_col: str,
                 secondary_metric: row[secondary_metric],
                 "total_actual": row["total_actual"],
                 "total_forecast": row["total_forecast"],
+                "n_folds": row.get("n_folds", 0),
+                "wape_std": row.get("wape_std", np.nan),
                 "selection_method": "fallback",
             })
             continue
@@ -746,6 +970,8 @@ def select_best_fit(eval_df: pd.DataFrame, id_col: str,
             secondary_metric: winner[secondary_metric],
             "total_actual": winner["total_actual"],
             "total_forecast": winner["total_forecast"],
+            "n_folds": winner.get("n_folds", 0),
+            "wape_std": winner.get("wape_std", np.nan),
             "selection_method": method,
         })
 
@@ -758,29 +984,35 @@ def select_best_fit(eval_df: pd.DataFrame, id_col: str,
 
 def best_fit_pipeline(df: pd.DataFrame, date_col: str, id_col: str,
                       value_col: str, horizon: int = 52,
-                      holdout_weeks: int = 52,
+                      eval_window: int = 13, n_folds: int = 3,
+                      fold_spacing: int = 13,
+                      inactive_weeks: int = 26,
                       primary_metric: str = "wape",
                       secondary_metric: str = "mase",
                       primary_weight: float = 0.7,
-                      secondary_weight: float = 0.3) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+                      secondary_weight: float = 0.3) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     '''
-    End-to-End Best-Fit Forecasting Pipeline  [v1.1.0]
+    End-to-End Best-Fit Forecasting Pipeline  [v1.3.0]
     ====================================================
-    Chains evaluation, tournament selection, and final forecast
-    generation. Recommended entry point for production use.
+    Chains inactive filtering, rolling-origin evaluation, tournament
+    selection, and final forecast generation. Recommended entry point
+    for production use.
+
+    Key change in v1.3.0: adds Step 0 to flag and exclude inactive
+    items (zero demand in trailing `inactive_weeks`). Returns a 4-tuple
+    including the inactive items DataFrame. Set inactive_weeks=0 to
+    skip filtering and include all items.
 
     Steps:
-        1. EVALUATE — backtest all benchmarks on holdout.
-        2. SELECT  — tournament picks best model per series.
-        3. FORECAST — re-fit winner on FULL history, generate forecasts.
-
-    Refactored in v1.1.0: Step 3 now only runs each series' winning
-    model (not all models), reducing compute by ~80% for 5-model registry.
+        0. FILTER   — flag inactive items and remove from pipeline.
+        1. EVALUATE — rolling-origin backtest on active items only.
+        2. SELECT   — tournament on fold-averaged metrics.
+        3. FORECAST — re-fit winner on FULL history, produce horizon-week forecast.
 
     Inputs
     ------
     df : pd.DataFrame
-        Long-format DataFrame. See `evaluate_benchmarks` for schema.
+        Long-format DataFrame.
 
         Expected schema:
             - date_col  : datetime-like — week-ending Sunday dates
@@ -797,10 +1029,22 @@ def best_fit_pipeline(df: pd.DataFrame, date_col: str, id_col: str,
         Column name for demand values.
 
     horizon : int, default 52
-        Weeks to forecast into the future.
+        Weeks to forecast into the future (final output).
 
-    holdout_weeks : int, default 52
-        Weeks to hold out for backtesting.
+    eval_window : int, default 13
+        Weeks per evaluation fold (3 months). This is the window
+        over which WAPE and MASE are computed for model selection.
+
+    n_folds : int, default 3
+        Number of rolling-origin folds for evaluation.
+
+    fold_spacing : int, default 13
+        Weeks between the start of consecutive folds.
+
+    inactive_weeks : int, default 26
+        Trailing weeks to check for activity. Items with zero demand
+        in this window are excluded. Set to 0 to disable filtering
+        and include all items.
 
     primary_metric : str, default "wape"
         Primary metric for tournament scoring.
@@ -816,18 +1060,20 @@ def best_fit_pipeline(df: pd.DataFrame, date_col: str, id_col: str,
 
     Output
     ------
-    Tuple of (eval_df, best_fit_df, forecast_df)
+    Tuple of (eval_df, best_fit_df, forecast_df, inactive_df)
 
         eval_df : pd.DataFrame
-            Full evaluation results for all models × series.
+            Full evaluation results for all models x active series,
+            metrics averaged across rolling-origin folds.
             See `evaluate_benchmarks` output schema.
 
         best_fit_df : pd.DataFrame
-            Tournament results, one row per series.
+            Tournament results, one row per active series.
             See `select_best_fit` output schema.
 
         forecast_df : pd.DataFrame
-            Final forecasts with ONLY the winning model per series.
+            Final forward-looking forecasts (full horizon), containing
+            only the winning model's output per active series.
 
             Schema:
                 - id_col     : str      — series identifier
@@ -836,22 +1082,58 @@ def best_fit_pipeline(df: pd.DataFrame, date_col: str, id_col: str,
                 - "forecast" : float    — predicted demand
                 - "step"     : int      — forecast step (1-horizon)
 
+        inactive_df : pd.DataFrame
+            Inactive items excluded from the pipeline. One row per
+            inactive item with diagnostics (last demand date, weeks
+            since demand, lifetime quantity).
+            See `flag_inactive_items` output schema.
+
     Example
     -------
-        eval_df, best_fit_df, forecast_df = best_fit_pipeline(
-            df, date_col="date", id_col="item_id", value_col="demand"
+        eval_df, best_fit_df, forecast_df, inactive_df = best_fit_pipeline(
+            df, date_col="date", id_col="item_id", value_col="demand",
+            eval_window=13, n_folds=3, inactive_weeks=26,
         )
+        print(f"Active: {best_fit_df.shape[0]}, Inactive: {inactive_df.shape[0]}")
         print(best_fit_df["best_model"].value_counts())
     '''
-    # Step 1: Evaluate
-    print("Step 1/3: Evaluating benchmark models on holdout...")
-    eval_df = evaluate_benchmarks(df, date_col, id_col, value_col, horizon, holdout_weeks)
+    total_items = df[id_col].nunique()
+
+    # Step 0: Filter inactive items
+    if inactive_weeks > 0:
+        print(f"Step 0/4: Filtering inactive items (zero demand in last {inactive_weeks} weeks)...")
+        active_df, inactive_df = flag_inactive_items(
+            df, date_col, id_col, value_col, inactive_weeks
+        )
+        n_inactive = len(inactive_df)
+        n_active = active_df[id_col].nunique()
+        print(f"  {n_active} active / {n_inactive} inactive out of {total_items} total items")
+        if n_inactive > 0 and "weeks_since_demand" in inactive_df.columns:
+            median_weeks = inactive_df["weeks_since_demand"].median()
+            print(f"  Inactive median weeks since last demand: {median_weeks:.0f}")
+    else:
+        print("Step 0/4: Inactive filtering disabled (inactive_weeks=0)")
+        active_df = df.copy()
+        inactive_df = pd.DataFrame()
+
+    if active_df[id_col].nunique() == 0:
+        print("WARNING: No active items remain after filtering. Returning empty results.")
+        empty = pd.DataFrame()
+        return empty, empty, empty, inactive_df
+
+    # Step 1: Evaluate with rolling-origin CV
+    print(f"Step 1/4: Rolling-origin evaluation ({n_folds} folds x "
+          f"{eval_window}-week window, {fold_spacing}-week spacing)...")
+    eval_df = evaluate_benchmarks(
+        active_df, date_col, id_col, value_col,
+        eval_window=eval_window, n_folds=n_folds, fold_spacing=fold_spacing
+    )
     n_series = eval_df[id_col].nunique()
     n_models = eval_df["model"].nunique()
     print(f"  Evaluated {n_series} series x {n_models} models")
 
     # Step 2: Tournament selection
-    print("Step 2/3: Running best-fit tournament...")
+    print("Step 2/4: Running best-fit tournament on fold-averaged metrics...")
     best_fit_df = select_best_fit(
         eval_df, id_col, primary_metric, secondary_metric,
         primary_weight, secondary_weight
@@ -861,12 +1143,12 @@ def best_fit_pipeline(df: pd.DataFrame, date_col: str, id_col: str,
     print(f"  Selection methods: {best_fit_df['selection_method'].value_counts().to_dict()}")
 
     # Step 3: Generate final forecasts — ONLY the winning model per series
-    print("Step 3/3: Generating final forecasts (winners only, full history)...")
+    print(f"Step 3/4: Generating {horizon}-week forecasts (winners only, full history)...")
     winner_map = best_fit_df.set_index(id_col)["best_model"].to_dict()
     steps = np.arange(1, horizon + 1)
     chunks = []
 
-    for series_id, grp in df.groupby(id_col):
+    for series_id, grp in active_df.groupby(id_col):
         winning_model = winner_map.get(series_id)
         if winning_model is None:
             continue
@@ -878,7 +1160,6 @@ def best_fit_pipeline(df: pd.DataFrame, date_col: str, id_col: str,
         start = pd.Timestamp(dates[-1]) + pd.Timedelta(weeks=1)
         forecast_dates = pd.date_range(start, periods=horizon, freq="W-SUN")
 
-        # Run only the winning model
         preds = _forecast_single_series(history, dates, horizon, [winning_model])
 
         chunk = pd.DataFrame({
@@ -891,9 +1172,10 @@ def best_fit_pipeline(df: pd.DataFrame, date_col: str, id_col: str,
         chunks.append(chunk)
 
     forecast_df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
-    print(f"  Generated {len(forecast_df)} forecast rows for {forecast_df[id_col].nunique()} series")
+    print(f"  Generated {len(forecast_df)} forecast rows for "
+          f"{forecast_df[id_col].nunique()} series")
 
-    return eval_df, best_fit_df, forecast_df
+    return eval_df, best_fit_df, forecast_df, inactive_df
 
 
 # =============================================================
@@ -901,13 +1183,17 @@ def best_fit_pipeline(df: pd.DataFrame, date_col: str, id_col: str,
 # =============================================================
 
 def summarize_results(best_fit_df: pd.DataFrame, eval_df: pd.DataFrame,
-                      id_col: str) -> pd.DataFrame:
+                      id_col: str,
+                      inactive_df: pd.DataFrame = None) -> pd.DataFrame:
     '''
-    Summary Statistics for Evaluation Results  [v1.1.0]
+    Summary Statistics for Evaluation Results  [v1.3.0]
     ====================================================
     Produces a concise summary table showing, for each model, its
-    win count, median WAPE, median MASE, and the demand-weighted
-    average WAPE across all series where it was evaluated.
+    win count, median WAPE (averaged across folds), median MASE,
+    demand-weighted WAPE, and median fold-to-fold WAPE stability.
+
+    In v1.3.0, optionally accepts the inactive_df and prints a
+    high-level activity summary before returning the model table.
 
     Inputs
     ------
@@ -920,39 +1206,63 @@ def summarize_results(best_fit_df: pd.DataFrame, eval_df: pd.DataFrame,
     id_col : str
         Series identifier column name.
 
+    inactive_df : pd.DataFrame or None, default None
+        Output of `flag_inactive_items()`. If provided, prints
+        an activity summary header before the model summary.
+
     Output
     ------
     pd.DataFrame
         One row per model.
 
         Schema:
-            - "model"              : str   — model name
-            - "wins"               : int   — number of series won
-            - "win_pct"            : float — percentage of total series
-            - "median_wape"        : float — median WAPE across all evaluated series
-            - "median_mase"        : float — median MASE across all evaluated series
-            - "demand_weighted_wape" : float — sum(|error|) / sum(actual) across series
+            - "model"                : str   — model name
+            - "wins"                 : int   — number of series won
+            - "win_pct"              : float — percentage of total active series
+            - "median_wape"          : float — median mean-WAPE across series
+            - "median_mase"          : float — median mean-MASE across series
+            - "demand_weighted_wape" : float — aggregate WAPE weighted by demand
+            - "median_wape_std"      : float — median fold-to-fold WAPE std
+                                               (lower = more stable model)
     '''
+    # Activity summary
+    if inactive_df is not None and len(inactive_df) > 0:
+        n_active = len(best_fit_df)
+        n_inactive = len(inactive_df)
+        n_total = n_active + n_inactive
+        print(f"Activity Summary: {n_active} active ({n_active/n_total*100:.1f}%) | "
+              f"{n_inactive} inactive ({n_inactive/n_total*100:.1f}%) | "
+              f"{n_total} total")
+
     # Win counts
     wins = best_fit_df["best_model"].value_counts().rename("wins")
     total = len(best_fit_df)
 
     # Median metrics from eval_df (across all series, not just wins)
     valid_eval = eval_df[np.isfinite(eval_df["wape"]) & np.isfinite(eval_df["mase"])]
+
     medians = valid_eval.groupby("model").agg(
         median_wape=("wape", "median"),
         median_mase=("mase", "median"),
     )
 
-    # Demand-weighted WAPE: sum of |errors| / sum of actuals
+    # Demand-weighted WAPE
     dw = valid_eval.groupby("model").apply(
         lambda g: (g["wape"] * g["total_actual"]).sum() / g["total_actual"].sum()
         if g["total_actual"].sum() > 0 else np.nan
     ).rename("demand_weighted_wape")
 
+    # Stability: median of per-series WAPE std across folds
+    if "wape_std" in valid_eval.columns:
+        stability = valid_eval.groupby("model")["wape_std"].median().rename("median_wape_std")
+    else:
+        stability = pd.Series(dtype=float, name="median_wape_std")
+
     summary = pd.DataFrame({"wins": wins})
     summary["win_pct"] = (summary["wins"] / total * 100).round(1)
-    summary = summary.join(medians).join(dw)
-    summary = summary.sort_values("wins", ascending=False).reset_index().rename(columns={"index": "model"})
+    summary = summary.join(medians).join(dw).join(stability)
+    summary = summary.sort_values("wins", ascending=False).reset_index().rename(
+        columns={"index": "model"}
+    )
 
     return summary

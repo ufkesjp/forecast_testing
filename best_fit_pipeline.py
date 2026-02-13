@@ -1266,3 +1266,9 @@ def summarize_results(best_fit_df: pd.DataFrame, eval_df: pd.DataFrame,
     )
 
     return summary
+
+# To run the whole pipeline 
+eval_df, best_fit_df, forecast_df, inactive_df = best_fit_pipeline(
+    df, date_col="date", id_col="item_id", value_col="demand",
+    inactive_weeks=26,  # 6-month lookback
+)

@@ -1,6 +1,6 @@
 # Best-Fit Benchmark Forecasting Pipeline
 
-A production-ready toolkit for automated best-fit model selection and forecasting of intermittent and lumpy weekly demand series. Designed for large-scale deployment across thousands of SKUs with minimal manual tuning.
+A production-ready toolkit for automated best-fit model selection and forecasting of weekly demand series. Designed for large-scale deployment across thousands of SKUs with minimal manual tuning.
 
 ## Overview
 

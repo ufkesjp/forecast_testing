@@ -5,12 +5,14 @@ A production-ready toolkit for automated best-fit model selection and forecastin
 ## Overview
 
 This pipeline automates the process of forecasting weekly demand by:
-1. **Filtering** inactive items to focus computational resources on active series
-2. **Evaluating** multiple benchmark models using rolling-origin cross-validation
-3. **Selecting** the best-performing model for each series via tournament-style ranking
-4. **Forecasting** future demand using the winning model trained on full history
+1. **Diagnosing** each series to classify its demand pattern and flag statistical outliers for review
+2. **Revising** history based on demand planner overrides (optional manual step)
+3. **Filtering** inactive items to focus computational resources on active series
+4. **Evaluating** multiple benchmark models using rolling-origin cross-validation
+5. **Selecting** the best-performing model for each series via tournament-style ranking
+6. **Forecasting** future demand using the revised history and the winning model
 
-**Version**: 1.4.1
+**Version**: 1.5.0
 
 ## Key Features
 
@@ -41,6 +43,12 @@ Each designed for different demand patterns:
 - **Fold-averaged metrics** prevent one anomalous period from dominating selection
 - **Per-fold diagnostics** for model stability analysis
 
+### 🔍 Outlier Detection & Demand Pattern Classification
+- **Demand pattern classification** using ADI/CV2 framework (Syntetos-Boylan): Smooth, Erratic, Intermittent, or Lumpy
+- **Statistical outlier flagging** via IQR method highlights anomalous demand periods for review
+- **Demand planner review loop**: Flagged outliers are surfaced to planners who can manually override history before forecasting
+- Revised history (with overrides applied) becomes the input for the best-fit forecasting pipeline
+
 ### 🚫 Inactive Item Detection
 - Automatically identifies and excludes items with zero demand in trailing window (default: 26 weeks)
 - Saves compute resources and prevents forecasting discontinued products
@@ -53,19 +61,34 @@ Each designed for different demand patterns:
 
 ## Quick Start
 
-### Basic Usage
+### Step 1: Diagnose Demand Patterns & Flag Outliers
 
 ```python
-from best_fit_pipeline import best_fit_pipeline
+from outlier_detection_demand_pattern import get_diagnostics
 import pandas as pd
 
 # Load your demand data
 df = pd.read_csv("demand_data.csv")
 
-# Expected schema:
-#   - date: datetime column with week-ending Sunday dates
-#   - item_id: unique identifier for each SKU/series
-#   - demand: non-negative numeric demand values
+# Run diagnostics — classifies demand patterns and flags outliers
+diagnostics = get_diagnostics(df)
+print(diagnostics)
+
+#   Forecast Series   ADI   CV2  Demand Pattern     Flagged Outliers
+#   SKU_001           1.05  0.32  Smooth
+#   SKU_002           2.10  0.61  Lumpy              2025-03-09, 2025-07-20
+#   SKU_003           1.50  0.15  Intermittent       2025-11-03
+```
+
+The diagnostics DataFrame is intended to be reviewed by a demand planner. For any flagged outliers, the planner can manually override the historical demand values, producing a revised history. This revised history is then used as input for the forecasting pipeline.
+
+### Step 2: Run the Best-Fit Forecasting Pipeline
+
+```python
+from best_fit_pipeline import best_fit_pipeline
+
+# Use revised history (after planner overrides) or original data
+# df = pd.read_csv("revised_demand_data.csv")
 
 # Run the pipeline
 eval_df, best_fit_df, forecast_df, inactive_df, fold_details = best_fit_pipeline(
@@ -491,6 +514,12 @@ print(bias[bias["mean_bias"].abs() > 5].sort_values("mean_bias", ascending=False
 
 ## Version History
 
+### v1.5.0 (2026-02-14)
+- Added outlier detection and demand pattern classification (`outlier_detection_demand_pattern.py`)
+- Classifies each series as Smooth, Erratic, Intermittent, or Lumpy using ADI/CV2 framework
+- Flags statistical outliers using IQR method for demand planner review
+- Supports a manual override workflow: planners revise history before forecasting
+
 ### v1.4.1 (2026-02-13)
 - Added damped trend seasonal (ETS with damped additive trend + additive seasonality) for smooth demand series
 - Added linear trend + seasonal (OLS trend + seasonal decomposition) — zero dependencies
@@ -540,12 +569,23 @@ print(bias[bias["mean_bias"].abs() > 5].sort_values("mean_bias", ascending=False
 
 ```python
 import pandas as pd
+from outlier_detection_demand_pattern import get_diagnostics
 from best_fit_pipeline import best_fit_pipeline, summarize_results
 
 # 1. Load data
 df = pd.read_csv("weekly_demand.csv", parse_dates=["date"])
 
-# 2. Run pipeline
+# 2. Diagnose demand patterns and flag outliers
+diagnostics = get_diagnostics(df)
+print(diagnostics)
+# Export for demand planner review
+diagnostics.to_csv("diagnostics_for_review.csv", index=False)
+
+# 3. (Manual step) Demand planner reviews flagged outliers,
+#    overrides history as needed, and saves revised data.
+#    df = pd.read_csv("revised_weekly_demand.csv", parse_dates=["date"])
+
+# 4. Run pipeline on revised history
 eval_df, best_fit_df, forecast_df, inactive_df, fold_details = best_fit_pipeline(
     df,
     date_col="date",
@@ -557,18 +597,18 @@ eval_df, best_fit_df, forecast_df, inactive_df, fold_details = best_fit_pipeline
     inactive_weeks=26,
 )
 
-# 3. Summarize results
+# 5. Summarize results
 summary = summarize_results(best_fit_df, eval_df, id_col="sku_id", inactive_df=inactive_df)
 print(summary)
 
-# 4. Inspect inactive items
+# 6. Inspect inactive items
 print(f"\nInactive items: {len(inactive_df)}")
 print(inactive_df.sort_values("weeks_since_demand").head(10))
 
-# 5. Export forecasts
+# 7. Export forecasts
 forecast_df.to_csv("forecasts_next_year.csv", index=False)
 
-# 6. Deep dive on specific series
+# 8. Deep dive on specific series
 series_id = "SKU_12345"
 series_eval = eval_df[eval_df["sku_id"] == series_id]
 print(f"\n{series_id} evaluation:")
@@ -577,7 +617,7 @@ print(series_eval[["model", "wape", "mase", "fold_wapes"]])
 winner = best_fit_df[best_fit_df["sku_id"] == series_id].iloc[0]
 print(f"\nWinner: {winner['best_model']} (WAPE={winner['wape']:.3f}, MASE={winner['mase']:.3f})")
 
-# 7. Week-level diagnostics for a specific series and model
+# 9. Week-level diagnostics for a specific series and model
 series_fold_data = fold_details[
     (fold_details["sku_id"] == series_id) &
     (fold_details["model"] == winner['best_model'])

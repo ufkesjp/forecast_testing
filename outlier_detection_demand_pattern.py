@@ -10,7 +10,8 @@ def get_diagnostics(df):
         demand_periods = np.count_nonzero(series)
         if demand_periods == 0:
             adi = np.nan
-            cv2 = np.nanpattern = "No Demand"
+            cv2 = np.nan
+            pattern = "No Demand"
         else:
             adi = len(series) / demand_periods
             nonzero_demand = series[series > 0]
@@ -29,8 +30,8 @@ def get_diagnostics(df):
         })
     
     def detect_outliers(group):
-        series = group('quantity_field')
-        dates = group('date_field')
+        series = group['quantity_field']
+        dates = group['date_field']
         Q1, Q3 = series.quantile(0.25), series.quantile(0.75)
         IQR = Q3 - Q1
         mask = (series < (Q1 - 1.5 * IQR)) | (series > (Q3 + 1.5 * IQR))

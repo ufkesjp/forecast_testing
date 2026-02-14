@@ -1185,7 +1185,7 @@ def best_fit_pipeline(df: pd.DataFrame, date_col: str, id_col: str,
     print(f"  Generated {len(forecast_df)} forecast rows for "
           f"{forecast_df[id_col].nunique()} series")
 
-    return eval_df, best_fit_df, forecast_df, inactive_df
+    return eval_df, best_fit_df, forecast_df, inactive_df, fold_details
 
 
 # =============================================================

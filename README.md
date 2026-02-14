@@ -10,7 +10,7 @@ This pipeline automates the process of forecasting weekly demand by:
 3. **Selecting** the best-performing model for each series via tournament-style ranking
 4. **Forecasting** future demand using the winning model trained on full history
 
-**Version**: 1.3.0
+**Version**: 1.4.0
 
 ## Key Features
 
@@ -19,13 +19,19 @@ This pipeline automates the process of forecasting weekly demand by:
 - No one-size-fits-all approach — adapts to each item's unique demand pattern
 - Composite scoring balances multiple evaluation metrics (WAPE + MASE)
 
-### 📊 Five Benchmark Models
+### 📊 Eleven Benchmark Models
 Each designed for different demand patterns:
 - **Seasonal Naïve**: Repeats last year's pattern (strong for seasonal items)
 - **Weekly Historical Average**: Multi-year seasonal averaging (smooths noise)
 - **Global Average**: Flat baseline (sanity check)
 - **TSB (Teunter-Syntetos-Babai)**: Intermittent demand specialist
 - **Temporal Aggregation + SES**: Reduces zero-inflation via bucketing
+- **Weighted Seasonal Average** *(v1.4.0)*: Recency-weighted week-of-year average
+- **Seasonal Median** *(v1.4.0)*: Median demand per week-of-year (robust to spikes)
+- **Seasonal Naïve Blend** *(v1.4.0)*: Tunable blend of seasonal naïve + weekly average
+- **Holt-Winters / ETS** *(v1.4.0)*: Additive trend + seasonal smoothing (requires statsmodels)
+- **Theta Method** *(v1.4.0)*: M3 competition winner, trend + seasonality (requires statsmodels)
+- **IMAPA** *(v1.4.0)*: Multi-aggregation intermittent demand forecasting
 
 ### 🔄 Robust Evaluation
 - **Rolling-origin cross-validation** with configurable folds (default: 3)
@@ -229,6 +235,54 @@ Separately tracks demand probability and demand size using exponential smoothing
 - `agg_periods=4`: Weeks per aggregation bucket (4 ≈ monthly)
 - `alpha=0.2`: SES smoothing parameter (0 < α < 1)
 
+### 6. Weighted Seasonal Average (`weighted_seasonal_avg`)
+**Best for:** Items with trending or shifting seasonal patterns
+
+Like `weekly_hist_avg` but applies exponential decay weighting so more recent years count more. Adapts to demand that's growing, shrinking, or shifting over time.
+
+**Hyperparameters:**
+- `decay=0.8`: Exponential decay factor (lower = more recency bias, 1.0 = equal weighting)
+
+### 7. Seasonal Median (`seasonal_median`)
+**Best for:** Intermittent/lumpy demand where spikes bias the mean upward
+
+Uses the median instead of the mean for each ISO week-of-year. Resists distortion from occasional large orders, producing a forecast that represents the "typical" week rather than the "average" week.
+
+### 8. Seasonal Naïve Blend (`seasonal_naive_blend`)
+**Best for:** Items where neither seasonal naïve nor weekly average alone performs well
+
+Weighted blend of seasonal naïve and weekly historical average. Hedges between repeating last year exactly and averaging all years.
+
+**Hyperparameters:**
+- `blend_weight=0.5`: Weight for seasonal naïve component (0.0 = pure weekly avg, 1.0 = pure seasonal naïve)
+
+### 9. Holt-Winters / ETS (`holt_winters`)
+**Best for:** Items with clear trend and seasonal components; requires 104+ weeks of history
+
+*Requires `statsmodels`.* Fits exponential smoothing with additive trend and additive seasonality. Automatically optimizes smoothing parameters. Falls back to global mean for sparse/short series.
+
+**Hyperparameters:**
+- `seasonal_periods=52`: Seasonal cycle length
+
+### 10. Theta Method (`theta`)
+**Best for:** Series with mixed trend and seasonality; M3 competition winner
+
+*Requires `statsmodels`.* Decomposes the series into theta lines capturing trend and short-term dynamics, applies SES, and recombines with seasonal adjustment. Requires 104+ weeks.
+
+**Hyperparameters:**
+- `seasonal_periods=52`: Seasonal cycle length
+
+### 11. IMAPA (`imapa`)
+**Best for:** Intermittent demand — outperforms single-level temporal aggregation
+
+Forecasts at multiple aggregation levels (weekly, bi-weekly, monthly, bi-monthly, quarterly) simultaneously and averages the disaggregated results. Different levels capture different aspects of the signal.
+
+**Hyperparameters:**
+- `agg_levels=(1, 2, 4, 8, 13)`: Aggregation levels in weeks
+- `alpha=0.2`: SES smoothing parameter
+
+**Reference:** Petropoulos & Kourentzes (2015), *Journal of the Operational Research Society*
+
 ## Evaluation Methodology
 
 ### Rolling-Origin Cross-Validation
@@ -273,7 +327,7 @@ Fold 3:
 ### Computational Complexity
 - **Time complexity**: O(S × M × F × W)
   - S = number of series
-  - M = number of models (5)
+  - M = number of models (11)
   - F = number of folds (default 3)
   - W = evaluation window length (default 13)
 
@@ -422,6 +476,12 @@ print(bias[bias["mean_bias"].abs() > 5].sort_values("mean_bias", ascending=False
 
 ## Version History
 
+### v1.4.0 (2026-02-13)
+- Added six new benchmark models: weighted seasonal average, seasonal median, seasonal naïve blend, Holt-Winters (ETS), Theta method, and IMAPA
+- `statsmodels` is now an optional dependency for Tier 2 models (Holt-Winters, Theta)
+- Tier 2 models gracefully return NaN when statsmodels is not installed (excluded from tournament)
+- Total model count: 11
+
 ### v1.3.0 (2026-02-13)
 - Added inactive item detection and filtering
 - Pipeline now returns 5-tuple including `inactive_df` and `fold_details`
@@ -538,4 +598,5 @@ To add a new benchmark model:
 
 - Teunter, R. H., Syntetos, A. A., & Babai, M. Z. (2011). "Intermittent demand: Linking forecasting to inventory obsolescence." *European Journal of Operational Research*, 214(3), 606-615.
 - Hyndman, R. J., & Athanasopoulos, G. (2021). *Forecasting: Principles and Practice* (3rd ed.). OTexts. [Chapter 5: Time series cross-validation](https://otexts.com/fpp3/tscv.html)
+- Petropoulos, F. & Kourentzes, N. (2015). "Forecast combinations for intermittent demand." *Journal of the Operational Research Society*, 66(6), 914-924.
 - Kolassa, S. (2016). "Evaluating predictive count data distributions in retail sales forecasting." *International Journal of Forecasting*, 32(3), 788-803.

@@ -11,6 +11,12 @@ Models Included:
     - Global Average (Flat)
     - Teunter-Syntetos-Babai (TSB)
     - Temporal Aggregation + Simple Exponential Smoothing (SES)
+    - Weighted Seasonal Average (v1.4.0)
+    - Seasonal Median (v1.4.0)
+    - Seasonal Naïve Blend (v1.4.0)
+    - Holt-Winters / ETS (v1.4.0, requires statsmodels)
+    - Theta Method (v1.4.0, requires statsmodels)
+    - IMAPA (v1.4.0)
 
 Evaluation Metrics:
     - WAPE (Weighted Absolute Percentage Error)
@@ -42,16 +48,29 @@ Version History:
                          in the trailing window (default 26 weeks) are flagged
                          and excluded before benchmarking. Pipeline returns a
                          4-tuple including the inactive items DataFrame.
+    v1.4.0  2026-02-13  Added six new models: weighted seasonal average,
+                         seasonal naïve blend, seasonal median, Holt-Winters
+                         (ETS), Theta method, and IMAPA. Statsmodels is now
+                         an optional dependency for Tier 2 models.
 
 Author: [Your Name / Team]
 License: [Your License]
 """
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 import numpy as np
 import pandas as pd
+import warnings
 from typing import Tuple, Optional, Dict, Callable, List
+
+# Conditional imports for Tier 2 models (Holt-Winters, Theta)
+try:
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing
+    from statsmodels.tsa.forecasting.theta import ThetaModel
+    HAS_STATSMODELS = True
+except ImportError:
+    HAS_STATSMODELS = False
 
 # =============================================================
 # Model Registry
@@ -462,6 +481,521 @@ def temporal_agg_ses(history: np.ndarray, dates: np.ndarray,
             weekly_forecast[i:i + agg_periods] = agg_forecast / agg_periods
 
     return weekly_forecast
+
+
+@register_model("weighted_seasonal_avg")
+def weighted_seasonal_average(history: np.ndarray, dates: np.ndarray,
+                               horizon: int = 52, decay: float = 0.8,
+                               **kwargs) -> np.ndarray:
+    '''
+    Weighted Seasonal Average Forecast  [v1.4.0]
+    ==============================================
+    Computes a recency-weighted average demand for each ISO week-of-year
+    across all years of history. More recent years receive exponentially
+    higher weight than older years, allowing the forecast to adapt to
+    shifting demand patterns over time.
+
+    This addresses the key weakness of the standard weekly_hist_avg model,
+    which weights all years equally — problematic when demand is trending
+    up/down or when product lifecycle changes have occurred.
+
+    Weight Calculation:
+        For a series spanning Y years, the weight for year y (0 = oldest,
+        Y-1 = most recent) is: weight = decay^(Y - 1 - y)
+
+        With decay=0.8 and 3 years:
+            Year 1 (oldest):  0.8^2 = 0.64
+            Year 2 (middle):  0.8^1 = 0.80
+            Year 3 (recent):  0.8^0 = 1.00
+
+    Inputs
+    ------
+    history : np.ndarray of shape (n,)
+        Historical demand values, ordered chronologically (oldest first).
+        Numeric, non-negative.
+
+    dates : np.ndarray of datetime64
+        Week-ending Sunday dates aligned 1-to-1 with history.
+
+    horizon : int, default 52
+        Number of future weekly periods to forecast.
+
+    decay : float, default 0.8
+        Exponential decay factor (0 < decay <= 1). Lower values give
+        more weight to recent years. At 1.0, this is identical to the
+        standard weekly_hist_avg. At 0.5, the most recent year gets
+        4x the weight of a year 2 years prior.
+
+    Output
+    ------
+    np.ndarray of shape (horizon,)
+        Forecasted demand. Each entry is the weighted average demand
+        for the corresponding ISO week-of-year.
+    '''
+    dates_ts = pd.DatetimeIndex(dates)
+    week_numbers = dates_ts.isocalendar().week.astype(int).values
+    years = dates_ts.year.values
+
+    unique_years = np.sort(np.unique(years))
+    n_years = len(unique_years)
+    year_rank = {yr: i for i, yr in enumerate(unique_years)}
+
+    # Build weighted average per week-of-year
+    global_mean = history.mean()
+    week_avg = {}
+
+    for w in range(1, 54):
+        mask = week_numbers == w
+        if not mask.any():
+            week_avg[w] = global_mean
+            continue
+
+        w_values = history[mask]
+        w_years = years[mask]
+        weights = np.array([decay ** (n_years - 1 - year_rank[yr]) for yr in w_years])
+
+        weight_sum = weights.sum()
+        if weight_sum > 0:
+            week_avg[w] = np.average(w_values, weights=weights)
+        else:
+            week_avg[w] = global_mean
+
+    # Generate forecast
+    start_date = dates_ts[-1] + pd.Timedelta(weeks=1)
+    forecast_dates = pd.date_range(start_date, periods=horizon, freq="W-SUN")
+    forecast_weeks = forecast_dates.isocalendar().week.astype(int).values
+
+    return np.array([week_avg.get(w, global_mean) for w in forecast_weeks])
+
+
+@register_model("seasonal_median")
+def seasonal_median(history: np.ndarray, dates: np.ndarray,
+                    horizon: int = 52, **kwargs) -> np.ndarray:
+    '''
+    Seasonal Median Forecast  [v1.4.0]
+    ====================================
+    Computes the median demand for each ISO week-of-year (1-53) across
+    all years of history, then maps each forecast week to its
+    corresponding week-of-year median.
+
+    For intermittent and lumpy demand, the median is often a better
+    central tendency measure than the mean. The mean gets pulled up by
+    occasional large orders (lumpy spikes), leading to systematic
+    over-forecasting on "normal" weeks. The median resists this effect
+    because it represents the 50th percentile — the "typical" week.
+
+    Example:
+        Week 12 historical values: [0, 0, 0, 0, 50]
+        Mean:   10.0  (biased upward by the single spike)
+        Median:  0.0  (represents the typical week accurately)
+
+    Falls back to the global median for any week-of-year with no history.
+
+    Inputs
+    ------
+    history : np.ndarray of shape (n,)
+        Historical demand values, ordered chronologically. Numeric.
+
+    dates : np.ndarray of datetime64
+        Week-ending Sunday dates aligned 1-to-1 with history.
+
+    horizon : int, default 52
+        Number of future weekly periods to forecast.
+
+    Output
+    ------
+    np.ndarray of shape (horizon,)
+        Forecasted demand. Each entry is the historical median demand
+        for the corresponding ISO week-of-year.
+    '''
+    dates_ts = pd.DatetimeIndex(dates)
+    week_numbers = dates_ts.isocalendar().week.astype(int).values
+
+    global_median = np.median(history)
+    week_med = {}
+    for w in range(1, 54):
+        mask = week_numbers == w
+        if mask.any():
+            week_med[w] = np.median(history[mask])
+        else:
+            week_med[w] = global_median
+
+    start_date = dates_ts[-1] + pd.Timedelta(weeks=1)
+    forecast_dates = pd.date_range(start_date, periods=horizon, freq="W-SUN")
+    forecast_weeks = forecast_dates.isocalendar().week.astype(int).values
+
+    return np.array([week_med.get(w, global_median) for w in forecast_weeks])
+
+
+@register_model("seasonal_naive_blend")
+def seasonal_naive_blend(history: np.ndarray, dates: np.ndarray,
+                         horizon: int = 52, blend_weight: float = 0.5,
+                         **kwargs) -> np.ndarray:
+    '''
+    Seasonal Naïve + Weekly Average Blend  [v1.4.0]
+    =================================================
+    Produces a weighted blend of the Seasonal Naïve forecast and the
+    Weekly Historical Average forecast. This hedges between "repeat
+    exactly what happened last year" and "average across all years,"
+    often landing in a sweet spot that neither model achieves alone.
+
+    The blend is particularly effective when:
+        - Last year had some anomalous weeks (seasonal naïve is noisy)
+        - But the overall seasonal shape is shifting (pure average is stale)
+
+    Formula:
+        forecast = blend_weight × seasonal_naïve + (1 - blend_weight) × weekly_hist_avg
+
+    Inputs
+    ------
+    history : np.ndarray of shape (n,)
+        Historical demand values, ordered chronologically. Numeric, non-negative.
+
+    dates : np.ndarray of datetime64
+        Week-ending Sunday dates aligned 1-to-1 with history.
+
+    horizon : int, default 52
+        Number of future weekly periods to forecast.
+
+    blend_weight : float, default 0.5
+        Weight given to the Seasonal Naïve component (0 to 1).
+        0.0 = pure weekly average, 1.0 = pure seasonal naïve.
+        0.5 = equal blend (default).
+
+    Output
+    ------
+    np.ndarray of shape (horizon,)
+        Blended forecast combining seasonal naïve and weekly average.
+    '''
+    # --- Seasonal Naïve component ---
+    last_year = history[-52:]
+    if len(last_year) < 52:
+        last_year = np.tile(history, (52 // len(history) + 1))[-52:]
+    reps = (horizon // 52) + 1
+    snaive = np.tile(last_year, reps)[:horizon]
+
+    # --- Weekly Historical Average component ---
+    dates_ts = pd.DatetimeIndex(dates)
+    week_numbers = dates_ts.isocalendar().week.astype(int).values
+
+    global_mean = history.mean()
+    week_avg = {}
+    for w in range(1, 54):
+        mask = week_numbers == w
+        if mask.any():
+            week_avg[w] = history[mask].mean()
+        else:
+            week_avg[w] = global_mean
+
+    start_date = dates_ts[-1] + pd.Timedelta(weeks=1)
+    forecast_dates = pd.date_range(start_date, periods=horizon, freq="W-SUN")
+    forecast_weeks = forecast_dates.isocalendar().week.astype(int).values
+    whist = np.array([week_avg.get(w, global_mean) for w in forecast_weeks])
+
+    # --- Blend ---
+    return blend_weight * snaive + (1 - blend_weight) * whist
+
+
+@register_model("holt_winters")
+def holt_winters(history: np.ndarray, dates: np.ndarray,
+                 horizon: int = 52, seasonal_periods: int = 52,
+                 **kwargs) -> np.ndarray:
+    '''
+    Holt-Winters Exponential Smoothing (ETS) Forecast  [v1.4.0]
+    =============================================================
+    Fits a Holt-Winters model with additive trend and additive
+    seasonality using statsmodels' ExponentialSmoothing. This is the
+    workhorse of production forecasting systems, simultaneously
+    capturing level, trend, and seasonal components.
+
+    The model automatically handles parameter optimization via
+    maximum likelihood estimation. Falls back to the global mean
+    if the model fails to fit (common for very sparse or short series).
+
+    Guard Rails:
+        - Requires statsmodels to be installed. If not available,
+          returns NaN array (model will be excluded from tournament).
+        - Series must have at least 2 full seasonal cycles (104 weeks)
+          for reliable estimation; shorter series trigger a fallback.
+        - All-zero or constant series trigger a fallback to avoid
+          numerical errors in the optimizer.
+
+    Inputs
+    ------
+    history : np.ndarray of shape (n,)
+        Historical demand values, ordered chronologically. Numeric.
+
+    dates : np.ndarray of datetime64
+        Week-ending Sunday dates aligned 1-to-1 with history.
+
+    horizon : int, default 52
+        Number of future weekly periods to forecast.
+
+    seasonal_periods : int, default 52
+        Length of the seasonal cycle (52 for yearly weekly data).
+
+    Output
+    ------
+    np.ndarray of shape (horizon,)
+        Forecasted demand from the Holt-Winters model. Falls back
+        to the global mean (flat forecast) if fitting fails.
+    '''
+    if not HAS_STATSMODELS:
+        return np.full(horizon, np.nan)
+
+    n = len(history)
+    fallback = np.full(horizon, history.mean())
+
+    # Guard: need at least 2 full cycles for seasonal model
+    if n < 2 * seasonal_periods:
+        return fallback
+
+    # Guard: constant or all-zero series can't be fit
+    if np.std(history) == 0:
+        return fallback
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+
+            model = ExponentialSmoothing(
+                history,
+                trend="add",
+                seasonal="add",
+                seasonal_periods=seasonal_periods,
+                initialization_method="estimated",
+            )
+            fit = model.fit(optimized=True, use_brute=True)
+            forecast = fit.forecast(horizon)
+
+            # Clamp negatives to zero (demand can't be negative)
+            forecast = np.maximum(forecast, 0.0)
+
+            # Guard: if forecast contains NaN/inf, fall back
+            if not np.all(np.isfinite(forecast)):
+                return fallback
+
+            return forecast
+
+    except Exception:
+        return fallback
+
+
+@register_model("theta")
+def theta_method(history: np.ndarray, dates: np.ndarray,
+                 horizon: int = 52, seasonal_periods: int = 52,
+                 **kwargs) -> np.ndarray:
+    '''
+    Theta Method Forecast  [v1.4.0]
+    =================================
+    The Theta method, which performed best in the M3 forecasting
+    competition. It decomposes the series into two "theta lines"
+    (one capturing long-term trend, one capturing short-term
+    dynamics), applies SES, and recombines. The statsmodels
+    implementation extends this with seasonal decomposition.
+
+    The method is notably effective for series where simple
+    exponential smoothing and seasonal naïve each capture part
+    of the signal but neither captures both.
+
+    Guard Rails:
+        - Requires statsmodels to be installed.
+        - Falls back to global mean on fitting failure.
+        - Clamps negative forecasts to zero.
+
+    Inputs
+    ------
+    history : np.ndarray of shape (n,)
+        Historical demand values, ordered chronologically. Numeric.
+
+    dates : np.ndarray of datetime64
+        Week-ending Sunday dates aligned 1-to-1 with history.
+
+    horizon : int, default 52
+        Number of future weekly periods to forecast.
+
+    seasonal_periods : int, default 52
+        Length of the seasonal cycle (52 for yearly weekly data).
+
+    Output
+    ------
+    np.ndarray of shape (horizon,)
+        Forecasted demand from the Theta method. Falls back to
+        global mean if fitting fails.
+    '''
+    if not HAS_STATSMODELS:
+        return np.full(horizon, np.nan)
+
+    n = len(history)
+    fallback = np.full(horizon, history.mean())
+
+    # Guard: need enough data for decomposition
+    if n < 2 * seasonal_periods:
+        return fallback
+
+    if np.std(history) == 0:
+        return fallback
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+
+            series = pd.Series(
+                history,
+                index=pd.date_range(
+                    end=pd.Timestamp(dates[-1]),
+                    periods=n,
+                    freq="W-SUN"
+                )
+            )
+
+            model = ThetaModel(
+                series,
+                period=seasonal_periods,
+                deseasonalize=True,
+                method="auto",
+            )
+            fit = model.fit()
+            forecast = fit.forecast(horizon).values
+
+            forecast = np.maximum(forecast, 0.0)
+
+            if not np.all(np.isfinite(forecast)):
+                return fallback
+
+            return forecast
+
+    except Exception:
+        return fallback
+
+
+@register_model("imapa")
+def imapa(history: np.ndarray, dates: np.ndarray,
+          horizon: int = 52, agg_levels: tuple = (1, 2, 4, 8, 13),
+          alpha: float = 0.2, **kwargs) -> np.ndarray:
+    '''
+    IMAPA — Intermittent Multiple Aggregation Prediction Algorithm  [v1.4.0]
+    =========================================================================
+    An extension of the temporal aggregation approach that forecasts at
+    MULTIPLE aggregation levels simultaneously and averages the
+    disaggregated results. This is specifically designed for intermittent
+    demand and consistently outperforms single-level aggregation in
+    empirical studies.
+
+    Algorithm:
+        For each aggregation level L in agg_levels:
+            1. Aggregate weekly history into L-week buckets (sum).
+            2. Apply Simple Exponential Smoothing to get one
+               aggregated-level forecast.
+            3. Disaggregate back to weekly using seasonal weights
+               (week-of-year proportions from history).
+
+        Final forecast = simple average across all aggregation levels.
+
+    The intuition is that different aggregation levels capture different
+    aspects of the signal: short buckets (1-2 weeks) preserve granular
+    timing, while longer buckets (8-13 weeks) smooth out intermittency
+    and reveal underlying trends. Averaging across levels combines
+    these complementary views.
+
+    Reference:
+        Petropoulos, F. & Kourentzes, N. (2015). "Forecast combinations
+        for intermittent demand." Journal of the Operational Research
+        Society, 66(6), 914-924.
+
+    Inputs
+    ------
+    history : np.ndarray of shape (n,)
+        Historical demand values, ordered chronologically. Non-negative.
+
+    dates : np.ndarray of datetime64
+        Week-ending Sunday dates aligned 1-to-1 with history.
+
+    horizon : int, default 52
+        Number of future weekly periods to forecast.
+
+    agg_levels : tuple of int, default (1, 2, 4, 8, 13)
+        Aggregation levels in weeks. Each level creates a separate
+        SES forecast that is disaggregated and then averaged.
+        (1) = weekly (no aggregation), (4) ≈ monthly, (13) ≈ quarterly.
+
+    alpha : float, default 0.2
+        SES smoothing parameter applied at each aggregation level.
+
+    Output
+    ------
+    np.ndarray of shape (horizon,)
+        Averaged disaggregated forecast across all aggregation levels.
+        Combines the strengths of multiple temporal views.
+    '''
+    values = history.astype(float)
+    n = len(values)
+
+    # --- Pre-compute seasonal weights (shared across all levels) ---
+    dates_ts = pd.DatetimeIndex(dates)
+    week_numbers = dates_ts.isocalendar().week.astype(int).values
+
+    week_means = {}
+    for w in range(1, 54):
+        mask = week_numbers == w
+        if mask.any():
+            week_means[w] = values[mask].mean()
+    overall_mean = np.mean(list(week_means.values())) if week_means else 1.0
+    seasonal_index = {w: m / overall_mean for w, m in week_means.items()} if overall_mean > 0 else {}
+
+    # --- Forecast dates and their seasonal weights ---
+    start_date = dates_ts[-1] + pd.Timedelta(weeks=1)
+    forecast_dates = pd.date_range(start_date, periods=horizon, freq="W-SUN")
+    forecast_weeks = forecast_dates.isocalendar().week.astype(int).values
+    raw_weights = np.array([seasonal_index.get(w, 1.0) for w in forecast_weeks])
+
+    # --- Forecast at each aggregation level ---
+    level_forecasts = []
+
+    for level in agg_levels:
+        if level > n:
+            # Not enough data for this aggregation level, skip
+            continue
+
+        if level == 1:
+            # No aggregation: just SES on the raw weekly series
+            ses_level = values[0]
+            for v in values[1:]:
+                ses_level = alpha * v + (1 - alpha) * ses_level
+            agg_forecast = max(ses_level, 0.0)
+        else:
+            # Aggregate into L-week buckets
+            trim = n - (n % level)
+            trimmed = values[-trim:]
+            agg = trimmed.reshape(-1, level).sum(axis=1)
+
+            # SES on aggregated series
+            ses_level = agg[0]
+            for v in agg[1:]:
+                ses_level = alpha * v + (1 - alpha) * ses_level
+            agg_forecast = max(ses_level, 0.0)
+
+        # --- Disaggregate using seasonal weights ---
+        weekly_forecast = np.zeros(horizon)
+
+        # For level=1, each "block" is 1 week
+        block_size = max(level, 1)
+
+        for i in range(0, horizon, block_size):
+            block = raw_weights[i:i + block_size]
+            block_sum = block.sum()
+            if block_sum > 0:
+                weekly_forecast[i:i + block_size] = (block / block_sum) * agg_forecast
+            else:
+                weekly_forecast[i:i + block_size] = agg_forecast / block_size
+
+        level_forecasts.append(weekly_forecast)
+
+    if not level_forecasts:
+        return np.full(horizon, history.mean())
+
+    # --- Average across all aggregation levels ---
+    return np.mean(level_forecasts, axis=0)
 
 
 # =============================================================

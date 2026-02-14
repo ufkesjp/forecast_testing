@@ -560,8 +560,8 @@ print(bias[bias["mean_bias"].abs() > 5].sort_values("mean_bias", ascending=False
 
 ## License & Author
 
-**Author**: [Your Name / Team]
-**License**: [Your License]
+**Author**: ufkesjp
+**License**: not licensed
 
 ---
 

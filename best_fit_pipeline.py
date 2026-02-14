@@ -17,6 +17,8 @@ Models Included:
     - Holt-Winters / ETS (v1.4.0, requires statsmodels)
     - Theta Method (v1.4.0, requires statsmodels)
     - IMAPA (v1.4.0)
+    - Damped Trend Seasonal / ETS(A,Ad,A) (v1.4.1, requires statsmodels)
+    - Linear Trend + Seasonal (v1.4.1)
 
 Evaluation Metrics:
     - WAPE (Weighted Absolute Percentage Error)
@@ -52,12 +54,16 @@ Version History:
                          seasonal naïve blend, seasonal median, Holt-Winters
                          (ETS), Theta method, and IMAPA. Statsmodels is now
                          an optional dependency for Tier 2 models.
+    v1.4.1  2026-02-13  Added damped_trend_seasonal (ETS with damped additive
+                         trend and additive seasonality) and linear_trend_seasonal
+                         (OLS trend + seasonal decomposition) for smooth demand
+                         series.
 
 Author: [Your Name / Team]
 License: [Your License]
 """
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 import numpy as np
 import pandas as pd
@@ -996,6 +1002,230 @@ def imapa(history: np.ndarray, dates: np.ndarray,
 
     # --- Average across all aggregation levels ---
     return np.mean(level_forecasts, axis=0)
+
+
+@register_model("damped_trend_seasonal")
+def damped_trend_seasonal(history: np.ndarray, dates: np.ndarray,
+                          horizon: int = 52, seasonal_periods: int = 52,
+                          **kwargs) -> np.ndarray:
+    '''
+    Damped Trend Seasonal ETS Forecast — ETS(A,Ad,A)  [v1.4.1]
+    ============================================================
+    Fits an Exponential Smoothing State Space model with additive
+    error, DAMPED additive trend, and additive seasonality. This
+    configuration is widely regarded as the single most reliable
+    general-purpose forecasting model for smooth demand series.
+
+    Why Damped Trend?
+    -----------------
+    Standard Holt-Winters (the existing `holt_winters` model) uses
+    an undamped trend, which projects the most recent trend slope
+    indefinitely into the future. Over a 52-week horizon, this often
+    produces forecasts that diverge unrealistically — shooting upward
+    or downward far beyond plausible levels.
+
+    The damped variant introduces a damping parameter (phi, typically
+    0.8–0.98) that progressively flattens the trend as the forecast
+    horizon increases. The effect is:
+        - Short-term (weeks 1-4): trend is nearly fully projected
+        - Medium-term (weeks 5-20): trend gradually flattens
+        - Long-term (weeks 20-52): forecast levels off to a plateau
+
+    This "optimistic short-term, conservative long-term" behavior
+    is exactly what demand planners want and is the reason damped
+    trend models consistently outperform undamped ones in forecasting
+    competitions (M3, M4, M5).
+
+    When to Use:
+        - A/B class items with stable, moderate-to-high volume
+        - Series showing clear trend (growth or decline)
+        - Series with consistent seasonal patterns
+        - Any smooth series where seasonal naïve feels too noisy
+
+    Guard Rails:
+        - Requires statsmodels. Returns NaN if not installed (auto-excluded
+          from tournament).
+        - Falls back to global mean if fitting fails.
+        - Requires at least 2 full seasonal cycles (104 weeks).
+        - Clamps negative forecasts to zero.
+        - Falls back on constant/zero-variance series.
+
+    Inputs
+    ------
+    history : np.ndarray of shape (n,)
+        Historical demand values, ordered chronologically. Numeric.
+
+    dates : np.ndarray of datetime64
+        Week-ending Sunday dates aligned 1-to-1 with history.
+
+    horizon : int, default 52
+        Number of future weekly periods to forecast.
+
+    seasonal_periods : int, default 52
+        Length of the seasonal cycle (52 for yearly weekly data).
+
+    Output
+    ------
+    np.ndarray of shape (horizon,)
+        Forecasted demand. Falls back to global mean if fitting fails.
+    '''
+    if not HAS_STATSMODELS:
+        return np.full(horizon, np.nan)
+
+    n = len(history)
+    fallback = np.full(horizon, history.mean())
+
+    # Guard: need at least 2 full cycles
+    if n < 2 * seasonal_periods:
+        return fallback
+
+    # Guard: constant or all-zero series
+    if np.std(history) == 0:
+        return fallback
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+
+            model = ExponentialSmoothing(
+                history,
+                trend="add",
+                damped_trend=True,
+                seasonal="add",
+                seasonal_periods=seasonal_periods,
+                initialization_method="estimated",
+            )
+            fit = model.fit(optimized=True, use_brute=True)
+            forecast = fit.forecast(horizon)
+
+            # Clamp negatives to zero
+            forecast = np.maximum(forecast, 0.0)
+
+            # Guard: NaN/inf check
+            if not np.all(np.isfinite(forecast)):
+                return fallback
+
+            return forecast
+
+    except Exception:
+        return fallback
+
+
+@register_model("linear_trend_seasonal")
+def linear_trend_seasonal(history: np.ndarray, dates: np.ndarray,
+                          horizon: int = 52, **kwargs) -> np.ndarray:
+    '''
+    Linear Trend + Seasonal Decomposition Forecast  [v1.4.1]
+    ==========================================================
+    Decomposes the series into trend and seasonal components using
+    a classical additive decomposition, fits a linear trend via OLS
+    on the deseasonalized data, then projects the trend forward and
+    reapplies the seasonal pattern.
+
+    This is a "structural" forecasting approach — it explicitly models
+    the two dominant components of smooth demand (trend + seasonality)
+    rather than using exponential smoothing. This gives the tournament
+    a fundamentally different perspective from the ETS-based models,
+    which is valuable for ensemble-style best-fit selection.
+
+    Algorithm:
+        1. Compute seasonal indices as the average demand for each
+           ISO week-of-year, normalized to sum to zero (additive).
+        2. Deseasonalize the history by subtracting seasonal indices.
+        3. Fit a simple linear regression (OLS) to the deseasonalized
+           series: y = a + b*t, where t is the time index.
+        4. Project the trend line forward for `horizon` weeks.
+        5. Add the seasonal indices back to the projected trend.
+        6. Clamp negative values to zero.
+
+    When to Use:
+        - Series with a clear, steady growth or decline
+        - Series where exponential smoothing over-reacts to recent noise
+        - As a "structural" complement to the ETS models — different
+          estimation philosophy helps the tournament diversify
+
+    Advantages over ETS:
+        - Zero dependencies (pure numpy/pandas)
+        - Fully deterministic — no optimizer convergence issues
+        - Transparent: you can inspect the exact trend slope and
+          seasonal indices
+        - Never fails to fit (no convergence problems)
+
+    Limitations:
+        - Assumes trend is linear (won't capture acceleration/deceleration)
+        - Equal weighting across all history (no recency bias)
+        - Additive seasonality only (won't handle multiplicative patterns)
+
+    Inputs
+    ------
+    history : np.ndarray of shape (n,)
+        Historical demand values, ordered chronologically. Numeric.
+
+    dates : np.ndarray of datetime64
+        Week-ending Sunday dates aligned 1-to-1 with history.
+
+    horizon : int, default 52
+        Number of future weekly periods to forecast.
+
+    Output
+    ------
+    np.ndarray of shape (horizon,)
+        Forecasted demand: projected linear trend + seasonal indices,
+        clamped at zero.
+    '''
+    values = history.astype(float)
+    n = len(values)
+
+    dates_ts = pd.DatetimeIndex(dates)
+    week_numbers = dates_ts.isocalendar().week.astype(int).values
+
+    # --- Step 1: Compute additive seasonal indices ---
+    global_mean = values.mean()
+    seasonal_idx = {}
+    for w in range(1, 54):
+        mask = week_numbers == w
+        if mask.any():
+            seasonal_idx[w] = values[mask].mean() - global_mean
+        else:
+            seasonal_idx[w] = 0.0
+
+    # --- Step 2: Deseasonalize ---
+    seasonal_component = np.array([seasonal_idx.get(w, 0.0) for w in week_numbers])
+    deseasonalized = values - seasonal_component
+
+    # --- Step 3: Fit linear trend via OLS ---
+    # y = a + b*t  where t = 0, 1, 2, ..., n-1
+    t = np.arange(n, dtype=float)
+    t_mean = t.mean()
+    y_mean = deseasonalized.mean()
+
+    # OLS closed-form: b = Cov(t, y) / Var(t), a = y_mean - b * t_mean
+    cov_ty = np.sum((t - t_mean) * (deseasonalized - y_mean))
+    var_t = np.sum((t - t_mean) ** 2)
+
+    if var_t > 0:
+        slope = cov_ty / var_t
+        intercept = y_mean - slope * t_mean
+    else:
+        slope = 0.0
+        intercept = y_mean
+
+    # --- Step 4: Project trend forward ---
+    future_t = np.arange(n, n + horizon, dtype=float)
+    trend_forecast = intercept + slope * future_t
+
+    # --- Step 5: Add seasonal component back ---
+    start_date = dates_ts[-1] + pd.Timedelta(weeks=1)
+    forecast_dates = pd.date_range(start_date, periods=horizon, freq="W-SUN")
+    forecast_weeks = forecast_dates.isocalendar().week.astype(int).values
+    future_seasonal = np.array([seasonal_idx.get(w, 0.0) for w in forecast_weeks])
+
+    forecast = trend_forecast + future_seasonal
+
+    # --- Step 6: Clamp negatives ---
+    forecast = np.maximum(forecast, 0.0)
+
+    return forecast
 
 
 # =============================================================

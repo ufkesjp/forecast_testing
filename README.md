@@ -10,7 +10,7 @@ This pipeline automates the process of forecasting weekly demand by:
 3. **Selecting** the best-performing model for each series via tournament-style ranking
 4. **Forecasting** future demand using the winning model trained on full history
 
-**Version**: 1.4.0
+**Version**: 1.4.1
 
 ## Key Features
 
@@ -19,7 +19,7 @@ This pipeline automates the process of forecasting weekly demand by:
 - No one-size-fits-all approach — adapts to each item's unique demand pattern
 - Composite scoring balances multiple evaluation metrics (WAPE + MASE)
 
-### 📊 Eleven Benchmark Models
+### 📊 Thirteen Benchmark Models
 Each designed for different demand patterns:
 - **Seasonal Naïve**: Repeats last year's pattern (strong for seasonal items)
 - **Weekly Historical Average**: Multi-year seasonal averaging (smooths noise)
@@ -32,6 +32,8 @@ Each designed for different demand patterns:
 - **Holt-Winters / ETS** *(v1.4.0)*: Additive trend + seasonal smoothing (requires statsmodels)
 - **Theta Method** *(v1.4.0)*: M3 competition winner, trend + seasonality (requires statsmodels)
 - **IMAPA** *(v1.4.0)*: Multi-aggregation intermittent demand forecasting
+- **Damped Trend Seasonal** *(v1.4.1)*: ETS(A,Ad,A) — best general-purpose model for smooth series (requires statsmodels)
+- **Linear Trend + Seasonal** *(v1.4.1)*: OLS trend + seasonal decomposition (no dependencies)
 
 ### 🔄 Robust Evaluation
 - **Rolling-origin cross-validation** with configurable folds (default: 3)
@@ -283,6 +285,19 @@ Forecasts at multiple aggregation levels (weekly, bi-weekly, monthly, bi-monthly
 
 **Reference:** Petropoulos & Kourentzes (2015), *Journal of the Operational Research Society*
 
+### 12. Damped Trend Seasonal (`damped_trend_seasonal`)
+**Best for:** Smooth, moderate-to-high volume items with trend and seasonality
+
+*Requires `statsmodels`.* ETS(A,Ad,A) — like Holt-Winters but with a damped trend that progressively flattens over the forecast horizon. Prevents the unrealistic divergence that undamped trend models produce over 52 weeks. Consistently the top performer in M3/M4/M5 forecasting competitions for smooth series.
+
+**Hyperparameters:**
+- `seasonal_periods=52`: Seasonal cycle length
+
+### 13. Linear Trend + Seasonal (`linear_trend_seasonal`)
+**Best for:** Series with steady growth/decline and consistent seasonality
+
+A structural decomposition approach: deseasonalizes via week-of-year indices, fits OLS linear trend, then reapplies seasonality. Zero dependencies, fully deterministic, and never fails to fit. Provides a fundamentally different perspective from ETS-based models for tournament diversification.
+
 ## Evaluation Methodology
 
 ### Rolling-Origin Cross-Validation
@@ -327,7 +342,7 @@ Fold 3:
 ### Computational Complexity
 - **Time complexity**: O(S × M × F × W)
   - S = number of series
-  - M = number of models (11)
+  - M = number of models (13)
   - F = number of folds (default 3)
   - W = evaluation window length (default 13)
 
@@ -475,6 +490,11 @@ print(bias[bias["mean_bias"].abs() > 5].sort_values("mean_bias", ascending=False
 - Review `selection_method` distribution — high "fallback" rate indicates an issue
 
 ## Version History
+
+### v1.4.1 (2026-02-13)
+- Added damped trend seasonal (ETS with damped additive trend + additive seasonality) for smooth demand series
+- Added linear trend + seasonal (OLS trend + seasonal decomposition) — zero dependencies
+- Total model count: 13
 
 ### v1.4.0 (2026-02-13)
 - Added six new benchmark models: weighted seasonal average, seasonal median, seasonal naïve blend, Holt-Winters (ETS), Theta method, and IMAPA

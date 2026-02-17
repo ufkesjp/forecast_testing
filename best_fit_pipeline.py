@@ -1563,11 +1563,13 @@ def evaluate_benchmarks(df: pd.DataFrame, date_col: str, id_col: str,
                 fold_metrics[model_name]["actuals"].append(np.sum(test_actual))
                 fold_metrics[model_name]["forecasts"].append(np.sum(preds_trimmed))
 
+                test_dates = all_dates[test_start:test_end]
                 for i in range(eval_window):
                     fold_details.append({
                         id_col: series_id,
                         "model": model_name,
                         "fold": fold_idx + 1,
+                        date_col: test_dates[i],
                         "actual": test_actual[i],
                         "forecast": preds_trimmed[i],
                     })

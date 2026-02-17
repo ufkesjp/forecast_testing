@@ -907,7 +907,7 @@ def best_fit_pipeline_parallel(df: pd.DataFrame, date_col: str, id_col: str,
                                 secondary_metric: str = "mase",
                                 primary_weight: float = 0.7,
                                 secondary_weight: float = 0.3,
-                                n_workers: int = None) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+                                n_workers: int = None) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     '''
     End-to-end best-fit forecasting pipeline with parallel processing.
 
@@ -917,7 +917,7 @@ def best_fit_pipeline_parallel(df: pd.DataFrame, date_col: str, id_col: str,
         2. SELECT   — tournament on fold-averaged metrics (single-process)
         3. FORECAST — generate final forecasts (distributed across workers)
 
-    Returns (eval_df, best_fit_df, forecast_df, inactive_df).
+    Returns (eval_df, best_fit_df, forecast_df, inactive_df, fold_details_df).
     '''
     if n_workers is None:
         n_workers = max(1, cpu_count() - 1)
@@ -945,7 +945,7 @@ def best_fit_pipeline_parallel(df: pd.DataFrame, date_col: str, id_col: str,
     if active_df[id_col].nunique() == 0:
         print("WARNING: No active items remain after filtering. Returning empty results.")
         empty = pd.DataFrame()
-        return empty, empty, empty, inactive_df
+        return empty, empty, empty, inactive_df, empty
 
     # Step 1: Parallel evaluation
     print(f"Step 1/3: Rolling-origin evaluation ({n_folds} folds x "
@@ -1005,7 +1005,7 @@ def best_fit_pipeline_parallel(df: pd.DataFrame, date_col: str, id_col: str,
     print(f"  Generated {len(forecast_df)} forecast rows for "
           f"{forecast_df[id_col].nunique() if len(forecast_df) > 0 else 0} series")
 
-    return eval_df, best_fit_df, forecast_df, inactive_df
+    return eval_df, best_fit_df, forecast_df, inactive_df, fold_details_df
 
 
 # =============================================================

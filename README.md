@@ -6,7 +6,7 @@ A production-ready toolkit for automated best-fit model selection and forecastin
 
 This pipeline automates the process of forecasting weekly demand by:
 1. **Filtering** inactive items to focus computational resources on active series
-2. **Evaluating** multiple benchmark models using rolling-origin cross-validation
+2. **Evaluating** multiple benchmark models using a holdout backtest
 3. **Selecting** the best-performing model for each series via tournament-style ranking
 4. **Forecasting** future demand using the winning model trained on full history
 
@@ -36,10 +36,8 @@ Each designed for different demand patterns:
 - **Linear Trend + Seasonal** *(v1.4.1)*: OLS trend + seasonal decomposition (no dependencies)
 
 ### 🔄 Robust Evaluation
-- **Rolling-origin cross-validation** with configurable folds (default: 3)
-- **3-month evaluation windows** (13 weeks) aligned with business planning cycles
-- **Fold-averaged metrics** prevent one anomalous period from dominating selection
-- **Per-fold diagnostics** for model stability analysis
+- **Single holdout backtest** using the last `eval_window` weeks as the test set (default: 52 weeks)
+- **Per-week diagnostics** for detailed model accuracy analysis
 
 ### 🚫 Inactive Item Detection
 - Automatically identifies and excludes items with zero demand in trailing window (default: 26 weeks)
@@ -49,7 +47,6 @@ Each designed for different demand patterns:
 ### 📏 Comprehensive Metrics
 - **WAPE** (Weighted Absolute Percentage Error): Industry-standard accuracy measure
 - **MASE** (Mean Absolute Scaled Error): Benchmarks against seasonal naïve
-- **Fold stability**: Tracks model consistency across evaluation periods
 
 ## Quick Start
 
@@ -74,8 +71,7 @@ eval_df, best_fit_df, forecast_df, inactive_df, fold_details = best_fit_pipeline
     id_col="item_id",
     value_col="demand",
     horizon=52,          # Forecast 52 weeks ahead
-    eval_window=13,      # Evaluate on 3-month windows
-    n_folds=3,           # Use 3 rolling-origin folds
+    eval_window=52,      # Holdout window (last 52 weeks as test set)
     inactive_weeks=26,   # Flag items with 6 months of zero demand
 )
 
@@ -91,14 +87,14 @@ forecast_df.to_csv("forecasts_52week.csv", index=False)
 The pipeline returns a 5-tuple of DataFrames for comprehensive analysis:
 
 #### 1. `eval_df` — Full Evaluation Results
-One row per series × model combination, showing fold-averaged performance:
+One row per series × model combination, showing holdout performance:
 - `item_id`: Series identifier
 - `model`: Benchmark model name
-- `wape`: Mean WAPE across folds
-- `mase`: Mean MASE across folds
-- `n_folds`: Number of folds evaluated
-- `wape_std`: Fold-to-fold WAPE variability (lower = more stable)
-- `fold_wapes`: Comma-separated WAPE per fold for diagnostics
+- `wape`: WAPE on holdout set
+- `mase`: MASE on holdout set
+- `n_folds`: Always 1 (single holdout)
+- `wape_std`: Always 0.0 (single holdout)
+- `fold_wapes`: WAPE value for diagnostics
 
 #### 2. `best_fit_df` — Tournament Winners
 One row per series, showing the selected model:
@@ -127,10 +123,10 @@ One row per inactive item (excluded from forecasting):
 - `lifetime_total_qty`: Sum of all demand ever recorded
 
 #### 5. `fold_details` — Week-Level Evaluation Details
-One row per series × model × fold × week (granular diagnostic data):
+One row per series × model × week (granular diagnostic data):
 - `item_id`: Series identifier
 - `model`: Benchmark model name
-- `fold`: Fold number (1, 2, 3, ...)
+- `fold`: Always 1 (single holdout)
 - `actual`: Actual demand value for that week
 - `forecast`: Forecasted demand value for that week
 
@@ -138,7 +134,7 @@ One row per series × model × fold × week (granular diagnostic data):
 - Inspect individual week-level forecast accuracy
 - Identify which specific weeks/periods a model struggled with
 - Calculate custom metrics beyond WAPE/MASE
-- Visualize forecast vs. actual for specific series and folds
+- Visualize forecast vs. actual for specific series
 - Debug anomalous evaluation results
 
 ## Data Requirements
@@ -150,9 +146,9 @@ Your DataFrame must contain:
 - **Value column**: Non-negative demand quantities (numeric)
 
 ### Minimum History Requirements
-- **Absolute minimum**: 52 weeks per series (one full year)
-- **Recommended**: 78+ weeks for robust cross-validation
-  - With default settings (3 folds, 13-week eval, 13-week spacing), minimum = 52 + 13 + (2 × 13) = 91 weeks
+- **Absolute minimum**: `min_train_weeks + eval_window` weeks per series
+  - With defaults (52-week training + 52-week holdout) = 104 weeks
+- **Recommended**: 156+ weeks (3 years) for best results
 - Series with insufficient history are automatically skipped with a warning
 
 ### Data Quality Expectations
@@ -172,9 +168,7 @@ best_fit_pipeline(
     id_col,
     value_col,
     horizon=52,              # Forecast horizon in weeks
-    eval_window=13,          # Weeks per evaluation fold (3 months)
-    n_folds=3,               # Number of rolling-origin folds
-    fold_spacing=13,         # Weeks between consecutive folds
+    eval_window=52,          # Holdout window (last N weeks as test set)
     inactive_weeks=26,       # Trailing weeks to check for activity (0 = disable)
     primary_metric="wape",   # Primary tournament metric
     secondary_metric="mase", # Secondary tournament metric
@@ -185,19 +179,14 @@ best_fit_pipeline(
 
 ### Tuning Recommendations
 
-**For different planning cycles:**
-- **Monthly planning**: `eval_window=4` (4 weeks)
-- **Quarterly planning**: `eval_window=13` (3 months) — **default**
-- **Annual planning**: `eval_window=52` (1 year)
+**For different holdout windows:**
+- **Quarterly evaluation**: `eval_window=13` (13 weeks)
+- **Annual evaluation**: `eval_window=52` (52 weeks) — **default**
 
 **For different product lifecycles:**
 - **Fast-moving consumer goods**: `inactive_weeks=13` (3 months)
 - **Standard retail**: `inactive_weeks=26` (6 months) — **default**
 - **Capital equipment / slow movers**: `inactive_weeks=52` (1 year)
-
-**For more/less stable evaluation:**
-- **More folds** (`n_folds=4-5`): More robust but requires longer history
-- **Fewer folds** (`n_folds=2`): Faster, less stable, works with shorter history
 
 ## Model Details
 
@@ -300,27 +289,17 @@ A structural decomposition approach: deseasonalizes via week-of-year indices, fi
 
 ## Evaluation Methodology
 
-### Rolling-Origin Cross-Validation
+### Holdout Backtest
 
-The pipeline uses time-series cross-validation to simulate realistic forecasting:
+The pipeline uses a single holdout split to evaluate models:
 
 ```
-Example: 130 weeks of history, 3 folds, 13-week eval window, 13-week spacing
+Example: 156 weeks of history, 52-week holdout window
 
-Fold 1 (most recent):
-  Train: weeks 1-117  →  Test: weeks 118-130
-
-Fold 2:
-  Train: weeks 1-104  →  Test: weeks 105-117
-
-Fold 3:
-  Train: weeks 1-91   →  Test: weeks 92-104
+  Train: weeks 1-104  →  Test: weeks 105-156
 ```
 
-**Why multiple folds?**
-- Single-fold backtests can be misleading if that period is anomalous
-- Averaging across folds produces more stable, generalizable model selection
-- Aligned with best practices in time-series forecasting research
+Each model is trained on the training portion and scored against the holdout test set.
 
 ### Tournament Selection
 
@@ -340,15 +319,14 @@ Fold 3:
 ## Performance Considerations
 
 ### Computational Complexity
-- **Time complexity**: O(S × M × F × W)
+- **Time complexity**: O(S × M × W)
   - S = number of series
   - M = number of models (13)
-  - F = number of folds (default 3)
-  - W = evaluation window length (default 13)
+  - W = evaluation window length (default 52)
 
 ### Optimization Tips
-- **Parallel processing**: The pipeline is embarassingly parallel at the series level — wrap the groupby loop in a multiprocessing pool for 5-10× speedup on multi-core machines
-- **Reduce folds**: Drop from 3 to 2 folds for 33% speedup (at cost of stability)
+- **Parallel processing**: The pipeline distributes series across workers via multiprocessing for significant speedups on multi-core machines
+- **Reduce eval window**: Use `eval_window=13` for faster evaluation
 - **Filter more aggressively**: Increase `inactive_weeks` to exclude more items
 - **Subset testing**: Run on a sample during development, full dataset in production
 
@@ -381,27 +359,18 @@ print(best_fit_df["selection_method"].value_counts())
 - **tiebreak**: Multiple models tied, broke tie via raw WAPE
 - **fallback**: All models had invalid metrics (investigate these series)
 
-### Stability Analysis
-Models with lower `wape_std` are more consistent across evaluation folds:
-
-```python
-print(eval_df.groupby("model")["wape_std"].median())
-```
-
-High `wape_std` suggests the model is sensitive to the evaluation period — may be overfitting or volatile.
-
 ### Deep Dive with `fold_details`
 The `fold_details` DataFrame provides week-level granularity for advanced diagnostics:
 
 **Example 1: Identify which weeks are hardest to forecast**
 ```python
-# Find weeks where all models struggled
-weekly_errors = fold_details.groupby(["item_id", "fold"]).apply(
+# Find series where models struggled most
+series_errors = fold_details.groupby("item_id").apply(
     lambda x: (x["actual"] - x["forecast"]).abs().mean()
 )
-worst_weeks = weekly_errors.nlargest(10)
-print("Weeks with highest forecast errors across all models:")
-print(worst_weeks)
+worst_series = series_errors.nlargest(10)
+print("Series with highest forecast errors:")
+print(worst_series)
 ```
 
 **Example 2: Visualize forecast vs. actual for a specific series**
@@ -411,41 +380,33 @@ import matplotlib.pyplot as plt
 series_id = "SKU_12345"
 model_name = "seasonal_naive"
 
-# Get fold details for this series and model
 data = fold_details[
     (fold_details["item_id"] == series_id) &
     (fold_details["model"] == model_name)
 ]
 
-# Plot each fold
-for fold_num in data["fold"].unique():
-    fold_data = data[data["fold"] == fold_num]
-    plt.figure(figsize=(10, 4))
-    plt.plot(fold_data["actual"].values, label="Actual", marker="o")
-    plt.plot(fold_data["forecast"].values, label="Forecast", marker="x")
-    plt.title(f"{series_id} - {model_name} - Fold {fold_num}")
-    plt.legend()
-    plt.show()
+plt.figure(figsize=(10, 4))
+plt.plot(data["actual"].values, label="Actual", marker="o")
+plt.plot(data["forecast"].values, label="Forecast", marker="x")
+plt.title(f"{series_id} - {model_name}")
+plt.legend()
+plt.show()
 ```
 
-**Example 3: Calculate custom metrics by fold**
+**Example 3: Calculate custom metrics per model**
 ```python
-# Calculate RMSE per fold per model
 from numpy import sqrt
 
-fold_rmse = fold_details.groupby(["item_id", "model", "fold"]).apply(
+model_rmse = fold_details.groupby(["item_id", "model"]).apply(
     lambda x: sqrt(((x["actual"] - x["forecast"]) ** 2).mean())
 ).reset_index(name="rmse")
 
-# Average RMSE across folds
-avg_rmse = fold_rmse.groupby(["item_id", "model"])["rmse"].mean()
-print("Average RMSE by series and model:")
-print(avg_rmse.head(20))
+print("RMSE by series and model:")
+print(model_rmse.head(20))
 ```
 
 **Example 4: Identify systematic bias patterns**
 ```python
-# Check if models consistently over-forecast or under-forecast
 bias = fold_details.groupby(["item_id", "model"]).apply(
     lambda x: (x["forecast"] - x["actual"]).mean()
 ).reset_index(name="mean_bias")
@@ -457,12 +418,10 @@ print(bias[bias["mean_bias"].abs() > 5].sort_values("mean_bias", ascending=False
 ## Troubleshooting
 
 ### "Skipped X series with insufficient history"
-**Cause**: Series shorter than `min_train_weeks + eval_window + (n_folds - 1) × fold_spacing`
+**Cause**: Series shorter than `min_train_weeks + eval_window` (default: 52 + 52 = 104 weeks)
 
 **Solutions:**
-- Reduce `n_folds` (e.g., 3 → 2)
-- Reduce `eval_window` (e.g., 13 → 8)
-- Reduce `fold_spacing` (e.g., 13 → 8) — **warning**: may cause fold overlap
+- Reduce `eval_window` (e.g., 52 → 26)
 - Accept that short-history items are skipped
 
 ### "No active items remain after filtering"
@@ -510,11 +469,9 @@ print(bias[bias["mean_bias"].abs() > 5].sort_values("mean_bias", ascending=False
 - Optional via `inactive_weeks` parameter (default 26, set to 0 to disable)
 
 ### v1.2.0 (2026-02-13)
-- Implemented rolling-origin cross-validation
+- Implemented holdout backtest evaluation
 - Configurable `eval_window` (decoupled from forecast horizon)
-- Metrics averaged across folds for stable selection
-- Added per-fold diagnostics output
-- Added fold stability tracking (`wape_std`)
+- Added per-week diagnostics output
 
 ### v1.1.0 (2026-02-13)
 - Vectorized forecast generation for efficiency
@@ -552,8 +509,7 @@ eval_df, best_fit_df, forecast_df, inactive_df, fold_details = best_fit_pipeline
     id_col="sku_id",
     value_col="units_sold",
     horizon=52,
-    eval_window=13,
-    n_folds=3,
+    eval_window=52,
     inactive_weeks=26,
 )
 
@@ -583,14 +539,12 @@ series_fold_data = fold_details[
     (fold_details["model"] == winner['best_model'])
 ]
 print(f"\nWeek-level performance for {winner['best_model']}:")
-print(series_fold_data.groupby("fold").apply(
-    lambda x: pd.Series({
-        "weeks": len(x),
-        "total_actual": x["actual"].sum(),
-        "total_forecast": x["forecast"].sum(),
-        "mae": (x["actual"] - x["forecast"]).abs().mean()
-    })
-))
+print(pd.Series({
+    "weeks": len(series_fold_data),
+    "total_actual": series_fold_data["actual"].sum(),
+    "total_forecast": series_fold_data["forecast"].sum(),
+    "mae": (series_fold_data["actual"] - series_fold_data["forecast"]).abs().mean()
+}))
 ```
 
 ## Contributing

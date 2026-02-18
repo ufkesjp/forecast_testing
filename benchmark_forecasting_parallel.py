@@ -76,29 +76,29 @@ def flag_inactive_items(df: pd.DataFrame, date_col: str, id_col: str,
     inactive_ids = trailing_demand[trailing_demand == 0].index
     active_ids = trailing_demand[trailing_demand > 0].index
 
-    inactive_records = []
     if len(inactive_ids) > 0:
-        for item_id in inactive_ids:
-            item_data = df[df[id_col] == item_id]
-            nonzero = item_data[item_data[value_col] > 0]
+        inactive_data = df[df[id_col].isin(inactive_ids)]
+        grouped = inactive_data.groupby(id_col)
 
-            if len(nonzero) > 0:
-                last_nonzero = nonzero[date_col].max()
-                weeks_since = int((global_max_date - last_nonzero).days / 7)
-            else:
-                last_nonzero = pd.NaT
-                weeks_since = np.nan
+        nonzero_data = inactive_data[inactive_data[value_col] > 0]
+        last_nonzero = nonzero_data.groupby(id_col)[date_col].max()
 
-            inactive_records.append({
-                id_col: item_id,
-                "status": "inactive",
-                "last_nonzero_date": last_nonzero,
-                "weeks_since_demand": weeks_since,
-                "total_history_weeks": len(item_data),
-                "lifetime_total_qty": item_data[value_col].sum(),
-            })
+        agg = grouped.agg(
+            total_history_weeks=(value_col, "count"),
+            lifetime_total_qty=(value_col, "sum"),
+        )
+        agg["last_nonzero_date"] = last_nonzero
+        agg["weeks_since_demand"] = (
+            (global_max_date - agg["last_nonzero_date"]).dt.days / 7
+        ).astype("Int64")
+        agg["status"] = "inactive"
 
-    inactive_df = pd.DataFrame(inactive_records)
+        inactive_df = agg.reset_index()
+        inactive_df = inactive_df[[id_col, "status", "last_nonzero_date",
+                                   "weeks_since_demand", "total_history_weeks",
+                                   "lifetime_total_qty"]]
+    else:
+        inactive_df = pd.DataFrame()
     active_df = df[df[id_col].isin(active_ids)].copy()
 
     return active_df, inactive_df
@@ -593,15 +593,15 @@ def _chunk_groups(groups: list, n_chunks: int) -> list:
 # =============================================================
 
 def _eval_worker(chunk, date_col, id_col, value_col, eval_window,
-                 n_folds, fold_spacing, min_train_weeks):
+                 min_train_weeks):
     '''
     Worker function for parallel evaluation. Takes a list of
-    (series_id, group_dataframe) tuples and runs rolling-origin CV
-    on each series.
+    (series_id, group_dataframe) tuples and runs a single holdout
+    evaluation on each series (last eval_window weeks as test set).
 
     Returns (eval_results_list, fold_details_list, skipped_count).
     '''
-    min_required = min_train_weeks + eval_window + (n_folds - 1) * fold_spacing
+    min_required = min_train_weeks + eval_window
     skipped = 0
     eval_results = []
     fold_details = []
@@ -617,76 +617,40 @@ def _eval_worker(chunk, date_col, id_col, value_col, eval_window,
         all_values = grp[value_col].values.astype(float)
         all_dates = pd.to_datetime(grp[date_col]).values
 
-        fold_metrics = {name: {"wapes": [], "mases": [], "actuals": [], "forecasts": []}
-                        for name in MODEL_REGISTRY}
+        train_end = n - eval_window
+        train_history = all_values[:train_end]
+        train_dates = all_dates[:train_end]
+        test_actual = all_values[train_end:]
+        test_dates = all_dates[train_end:]
 
-        folds_evaluated = 0
-        for fold_idx in range(n_folds):
-            test_end = n - (fold_idx * fold_spacing)
-            test_start = test_end - eval_window
-            train_end = test_start
+        model_outputs = _forecast_single_series(train_history, train_dates, eval_window)
 
-            if train_end < min_train_weeks:
-                continue
-
-            train_history = all_values[:train_end]
-            train_dates = all_dates[:train_end]
-            test_actual = all_values[test_start:test_end]
-
-            model_outputs = _forecast_single_series(train_history, train_dates, eval_window)
-
-            for model_name, preds in model_outputs.items():
-                preds_trimmed = preds[:eval_window]
-                wape = calculate_wape(test_actual, preds_trimmed)
-                mase = calculate_mase(test_actual, preds_trimmed, train_history)
-
-                fold_metrics[model_name]["wapes"].append(wape)
-                fold_metrics[model_name]["mases"].append(mase)
-                fold_metrics[model_name]["actuals"].append(np.sum(test_actual))
-                fold_metrics[model_name]["forecasts"].append(np.sum(preds_trimmed))
-
-                test_dates = all_dates[test_start:test_end]
-                for i in range(eval_window):
-                    fold_details.append({
-                        id_col: series_id,
-                        "model": model_name,
-                        "fold": fold_idx + 1,
-                        date_col: test_dates[i],
-                        "actual": test_actual[i],
-                        "forecast": preds_trimmed[i],
-                    })
-
-            folds_evaluated += 1
-
-        if folds_evaluated == 0:
-            skipped += 1
-            continue
-
-        for model_name, metrics in fold_metrics.items():
-            if not metrics["wapes"]:
-                continue
-
-            wapes = np.array(metrics["wapes"])
-            mases = np.array(metrics["mases"])
-
-            wapes_clean = np.where(np.isinf(wapes), np.nan, wapes)
-            mases_clean = np.where(np.isinf(mases), np.nan, mases)
-
-            mean_wape = np.nanmean(wapes_clean) if not np.all(np.isnan(wapes_clean)) else np.inf
-            mean_mase = np.nanmean(mases_clean) if not np.all(np.isnan(mases_clean)) else np.inf
+        for model_name, preds in model_outputs.items():
+            preds_trimmed = preds[:eval_window]
+            wape = calculate_wape(test_actual, preds_trimmed)
+            mase = calculate_mase(test_actual, preds_trimmed, train_history)
 
             eval_results.append({
                 id_col: series_id,
                 "model": model_name,
-                "wape": mean_wape,
-                "mase": mean_mase,
-                "total_actual": np.sum(metrics["actuals"]),
-                "total_forecast": np.sum(metrics["forecasts"]),
-                "n_folds": len(metrics["wapes"]),
-                "wape_std": np.nanstd(wapes_clean) if len(wapes_clean) > 1 else 0.0,
-                "fold_wapes": ",".join([f"{w:.4f}" if np.isfinite(w) else "inf"
-                                        for w in wapes]),
+                "wape": wape,
+                "mase": mase,
+                "total_actual": np.sum(test_actual),
+                "total_forecast": np.sum(preds_trimmed),
+                "n_folds": 1,
+                "wape_std": 0.0,
+                "fold_wapes": f"{wape:.4f}" if np.isfinite(wape) else "inf",
             })
+
+            for i in range(eval_window):
+                fold_details.append({
+                    id_col: series_id,
+                    "model": model_name,
+                    "fold": 1,
+                    date_col: test_dates[i],
+                    "actual": test_actual[i],
+                    "forecast": preds_trimmed[i],
+                })
 
     return eval_results, fold_details, skipped
 
@@ -845,12 +809,11 @@ def summarize_results(best_fit_df: pd.DataFrame, eval_df: pd.DataFrame,
 # =============================================================
 
 def evaluate_benchmarks_parallel(df: pd.DataFrame, date_col: str, id_col: str,
-                                  value_col: str, eval_window: int = 13,
-                                  n_folds: int = 3, fold_spacing: int = 13,
+                                  value_col: str, eval_window: int = 52,
                                   min_train_weeks: int = 52,
                                   n_workers: int = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
     '''
-    Parallel rolling-origin cross-validation evaluation.
+    Parallel holdout evaluation.
     Distributes series across workers using multiprocessing.Pool.
     '''
     if n_workers is None:
@@ -865,8 +828,6 @@ def evaluate_benchmarks_parallel(df: pd.DataFrame, date_col: str, id_col: str,
         id_col=id_col,
         value_col=value_col,
         eval_window=eval_window,
-        n_folds=n_folds,
-        fold_spacing=fold_spacing,
         min_train_weeks=min_train_weeks,
     )
 
@@ -885,11 +846,10 @@ def evaluate_benchmarks_parallel(df: pd.DataFrame, date_col: str, id_col: str,
         all_fold_details.extend(fold_details)
         total_skipped += skipped
 
-    min_required = min_train_weeks + eval_window + (n_folds - 1) * fold_spacing
+    min_required = min_train_weeks + eval_window
     if total_skipped:
         print(f"WARNING: Skipped {total_skipped} series with < {min_required} weeks of history "
-              f"(need {min_train_weeks} train + {eval_window} eval + "
-              f"{(n_folds - 1) * fold_spacing} spacing).")
+              f"(need {min_train_weeks} train + {eval_window} eval).")
 
     return pd.DataFrame(all_eval_results), pd.DataFrame(all_fold_details)
 
@@ -900,8 +860,7 @@ def evaluate_benchmarks_parallel(df: pd.DataFrame, date_col: str, id_col: str,
 
 def best_fit_pipeline_parallel(df: pd.DataFrame, date_col: str, id_col: str,
                                 value_col: str, horizon: int = 52,
-                                eval_window: int = 13, n_folds: int = 3,
-                                fold_spacing: int = 13,
+                                eval_window: int = 52,
                                 inactive_weeks: int = 26,
                                 primary_metric: str = "wape",
                                 secondary_metric: str = "mase",
@@ -913,8 +872,8 @@ def best_fit_pipeline_parallel(df: pd.DataFrame, date_col: str, id_col: str,
 
     Steps:
         0. FILTER   — flag inactive items (single-process, already fast)
-        1. EVALUATE — rolling-origin backtest (distributed across workers)
-        2. SELECT   — tournament on fold-averaged metrics (single-process)
+        1. EVALUATE — holdout backtest (distributed across workers)
+        2. SELECT   — tournament on metrics (single-process)
         3. FORECAST — generate final forecasts (distributed across workers)
 
     Returns (eval_df, best_fit_df, forecast_df, inactive_df, fold_details_df).
@@ -948,12 +907,11 @@ def best_fit_pipeline_parallel(df: pd.DataFrame, date_col: str, id_col: str,
         return empty, empty, empty, inactive_df, empty
 
     # Step 1: Parallel evaluation
-    print(f"Step 1/3: Rolling-origin evaluation ({n_folds} folds x "
-          f"{eval_window}-week window, {fold_spacing}-week spacing) "
+    print(f"Step 1/3: Holdout evaluation ({eval_window}-week window) "
           f"with {n_workers} workers...")
     eval_df, fold_details_df = evaluate_benchmarks_parallel(
         active_df, date_col, id_col, value_col,
-        eval_window=eval_window, n_folds=n_folds, fold_spacing=fold_spacing,
+        eval_window=eval_window,
         n_workers=n_workers,
     )
     n_series = eval_df[id_col].nunique()

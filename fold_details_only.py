@@ -1,4 +1,4 @@
-# “””
+“””
 generate_fold_details.py
 
 Generates a fold_details DataFrame that shows the actual and forecasted
